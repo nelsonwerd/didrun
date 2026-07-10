@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "didrun"
+version = "0.0.1"
+description = "Flight records for agent-written code: deterministic session capture, evidence ledger, and graded verification."
+requires-python = ">=3.14"
+license = "Apache-2.0"
+readme = "README.md"
+authors = [{ name = "didrun contributors" }]
+keywords = ["ai-agents", "provenance", "verification", "git", "evidence"]
+# NO runtime dependencies. Stdlib-only is a hard invariant (auditability is the trust wedge).
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+didrun = "didrun.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

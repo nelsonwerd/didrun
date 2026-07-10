@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.DS_Store
+# The ledger is secret-bearing by construction — never commit it.
+.didrun/
+*.didrun-bundle
