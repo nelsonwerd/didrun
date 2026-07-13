@@ -1,6 +1,16 @@
 # didrun
 
+[![ci](https://github.com/nelsonwerd/didrun/actions/workflows/ci.yml/badge.svg)](https://github.com/nelsonwerd/didrun/actions/workflows/ci.yml)
+&nbsp;![status: v0 · experimental](https://img.shields.io/badge/status-v0%20%C2%B7%20experimental-orange)
+&nbsp;![python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+&nbsp;![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green)
+
 **Flight records for agent-written code.**
+
+> **v0 · experimental.** The core (`didrun run/claim/seal/verify/show`) works and is
+> covered by CI on Linux + macOS across Python 3.11–3.13, but the API and CLI may
+> still change, and there has been no independent security review yet. Treat it
+> accordingly. See [what it does and does not attest](docs/TRUST_MODEL.md).
 
 When an AI coding agent says *"done — tests pass,"* the proof usually evaporates
 the moment the session ends. The transcript is unverifiable prose, CI only re-runs

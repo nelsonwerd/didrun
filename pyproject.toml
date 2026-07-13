@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "didrun"
-version = "0.0.1"
+version = "0.1.0"
 description = "Flight records for agent-written code: deterministic session capture, evidence ledger, and graded verification."
 requires-python = ">=3.11"
 license = "Apache-2.0"
