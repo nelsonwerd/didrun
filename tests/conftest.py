@@ -24,6 +24,12 @@ def repo(tmp_path: Path) -> Path:
     _git(r, "config", "user.email", "t@t.t")
     _git(r, "config", "user.name", "t")
     _git(r, "config", "commit.gpgsign", "false")
+    # Disable git's background auto-maintenance/gc so it can't drop a
+    # maintenance.lock or repack objects mid-test — that housekeeping is git's,
+    # not didrun's, and it made the object-isolation check flaky (seen on a
+    # macOS CI runner). Determinism is a test invariant here.
+    _git(r, "config", "maintenance.auto", "false")
+    _git(r, "config", "gc.auto", "0")
     (r / "calc.py").write_text("def add(a, b):\n    return a + b\n")
     _git(r, "add", "calc.py")
     _git(r, "commit", "-qm", "init")

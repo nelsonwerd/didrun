@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from didrun import gitplumbing as gp
@@ -22,15 +23,33 @@ def test_untracked_file_changes_digest(repo: Path):
     assert before != after
 
 
+def _loose_objects(repo: Path) -> set:
+    """Loose git object files only (``objects/<2-hex>/<38-hex>``).
+
+    Deliberately excludes git's own transient/metadata files (``*.lock`` from
+    background auto-maintenance, ``pack/``, ``info/``) — those are git's
+    housekeeping, not something didrun writes, and counting them makes the
+    isolation check flaky. This measures exactly what pollution would be:
+    a new loose object in the user's DB.
+    """
+    root = repo / ".git" / "objects"
+    return {
+        p for p in root.rglob("*")
+        if p.is_file()
+        and re.fullmatch(r"[0-9a-f]{2}", p.parent.name)
+        and re.fullmatch(r"[0-9a-f]{38,62}", p.name)
+    }
+
+
 def test_object_isolation(repo: Path, tmp_path: Path):
     """Digest objects land in the ledger dir, never the user's object DB."""
     ledger_obj = tmp_path / "ledger-obj"
-    objects_before = set((repo / ".git" / "objects").rglob("*"))
+    objects_before = _loose_objects(repo)
     (repo / "dirty.py").write_text("y = 2\n")
     digest = gp.tree_digest(repo, ledger_obj)
-    objects_after = set((repo / ".git" / "objects").rglob("*"))
+    objects_after = _loose_objects(repo)
     assert digest is not None
-    assert objects_before == objects_after  # zero pollution
+    assert objects_before == objects_after  # zero pollution (no new loose objects)
     assert any(ledger_obj.rglob("*"))  # objects went to the ledger
 
 
