@@ -107,13 +107,18 @@ Universal, invisible capture of everything an agent runs is not possible from
 outside the agent (measured — absolute-path executions escape a PATH shim every
 time). didrun is honest about this instead of pretending:
 
-- **Tier 0 — `didrun run -- <cmd>`:** the trust core. Complete argv/exit/output/tree state. This is the only tier that *guarantees* a claim's evidence.
+- **Tier 0 — `didrun run -- <cmd>`:** the trust core. Complete argv/exit/output/tree state. This is the only tier that *guarantees* a claim's evidence — **and, in v0, the only tier wired to a command.** Use it explicitly for anything you'll claim.
 - **Tier 1 — PATH shim:** re-dispatches bare-name commands through Tier 0. Absolute-path invocations and shell builtins are honest structural gaps.
 - **Tier 2 — per-shell trap:** bash/zsh enrichment, **inert unless a didrun session is active** (it never records unrelated shell activity on your machine).
 - **Tier 3 — native adapters:** e.g. Claude Code hooks. Enrichment only; the core works without them.
 
 Every recorded event carries a coverage grade, so the manifest is honest about
 what was and wasn't observed.
+
+> **v0 status:** Tiers 1–3 exist as measured, tested library functions (see
+> `harness/` and `src/didrun/capture.py`) but are **not yet exposed as a
+> user-facing `install`/`hooks` command** — wiring them up is on the roadmap.
+> Today you get their guarantee by calling `didrun run -- <cmd>` directly.
 
 ## What didrun is not
 

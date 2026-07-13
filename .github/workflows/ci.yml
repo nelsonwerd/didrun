@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Configure git (tests create throwaway repos)
+        run: |
+          git config --global user.email ci@didrun.test
+          git config --global user.name ci
+          git config --global init.defaultBranch main
+      - name: Install (stdlib-only runtime; pytest is the only dev dep)
+        run: python -m pip install -e ".[dev]"
+      - name: Run the test suite
+        run: python -m pytest -q
+      - name: Capture kill-gate (S1-S5 recall) must PASS
+        run: python -m harness.recall
