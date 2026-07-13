@@ -129,7 +129,7 @@ def seal(
     # and permanently visible in their own commit's manifest (history is never
     # rewritten); without this scoping, a failed claim from unit 1 would poison
     # every later seal and a fix-verify-reseal loop could never converge.
-    # (Found by dogfooding the fix-loop; claims remain append-only.)
+    # The claims file itself remains append-only; only the seal's view is scoped.
     all_claims = _load_claims(session)
     watermark = _last_seal_watermark(session)
     new_claims = all_claims[watermark:]

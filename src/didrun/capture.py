@@ -32,7 +32,7 @@ from . import gitplumbing
 
 # Environment variables whose presence/identity is safe to fingerprint. We hash
 # a sorted allowlist rather than the raw environment so the fingerprint never
-# leaks a secret (redaction of captured *output* is a separate pass, P2.3).
+# leaks a secret (redaction of captured *output* is a separate pass; see redact.py).
 _ENV_FINGERPRINT_KEYS = ("PATH", "SHELL", "LANG", "PWD", "VIRTUAL_ENV")
 
 # The env var that gates Tier-2 traps. The trap does nothing unless this is set,

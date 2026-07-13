@@ -1,7 +1,7 @@
 # didrun capture kill-gate harness
 
-This harness is the instrument didrun's capture **kill-gate** depends on. It is
-top of the drop order — gate machinery is never dropped.
+This harness is the instrument didrun's capture **kill-gate** depends on — the
+highest-priority piece of test infrastructure in the project.
 
 ## What it measures (S1-S5, machine-cleared)
 
