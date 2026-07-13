@@ -86,6 +86,33 @@ didrun verify --html evidence.html
 The report is a single file with zero external assets — it opens offline, prints
 cleanly, and is safe to attach to a PR (secrets are redacted from every export).
 
+## Use it with your coding agent
+
+You don't have to run these commands by hand. Tell your agent to route its own
+verification through didrun, and it produces receipts as a side effect of working.
+Drop the snippet for your tool into its instructions file:
+
+- **Claude Code** → add the block to `CLAUDE.md`
+- **Codex / agent-agnostic** → add it to `AGENTS.md`
+- **Cursor** → a project rule
+- **Any agent** → a system-prompt block
+
+Copy-paste snippets for each — plus the honest bounds — are in
+[docs/agents.md](docs/agents.md). The short version:
+
+```markdown
+For any check you'll cite as evidence, run `didrun run -- <cmd>`. Per finished
+unit: `didrun claim <type>`, commit, `didrun seal`. Gate on
+`didrun verify --strict` and loop until it exits 0. Never claim un-wrapped work
+as verified.
+```
+
+This is **cooperative capture** — it works because the agent follows the
+instruction, not because anything is enforced. Commands the agent *doesn't* route
+through `didrun run` are simply not recorded (a claim with no backing run grades
+`unknown`), so didrun never mistakes "didn't capture it" for "verified." Enforced,
+agent-can't-forget capture is what Tiers 1–3 are for — see the note below.
+
 ## The grades
 
 didrun never says "verified — trust me." Each claim gets an honest grade against
