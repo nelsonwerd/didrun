@@ -156,19 +156,24 @@ def tree_digest(
             env["GIT_OBJECT_DIRECTORY"] = str(ledger_objects)
             env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(git_dir(repo) / "objects")
 
-        # Stage everything into the throwaway index, excluding the ledger dir
-        # (and any caller exclusions) via pathspec. If this fails, we must NOT
+        # Stage everything into the throwaway index. If this fails, we must NOT
         # write a partial tree — a partial tree would silently under-report dirt.
-        add_args = ["add", "-A", "--"]
-        add_args.append(".")
-        for spec in exclude:
-            add_args.append(f":(exclude,top){spec}")
-            add_args.append(f":(exclude,top){spec}/**")
-        add = _run_git(add_args, repo, env=env, check=False)
+        #
+        # Exclusion is done by the `rm -r --cached` pass below, NOT by an
+        # :(exclude,top) pathspec here. git errors out when a pathspec matches a
+        # gitignored path, and `.didrun/` gitignored is the config didrun's own
+        # docs mandate — naming the ledger in the pathspec made the add fail
+        # there, which returned None and graded every claim `unknown`. A bare
+        # `add -A -- .` silently skips ignored paths, so the two configs converge:
+        # gitignored, the ledger never enters the index; not gitignored, it enters
+        # and the rm --cached pass takes it back out. Never use `add -f` to dodge
+        # this — that forces *every* ignored path (node_modules, build output)
+        # into the digest.
+        add = _run_git(["add", "-A", "--", "."], repo, env=env, check=False)
         if add.returncode != 0:
             return None
-        # Also drop any already-staged ledger paths inherited from the copied
-        # index, so a repo that previously staged .didrun still digests clean.
+        # Drop ledger paths that reached the index — staged in this add (ledger
+        # not gitignored) or inherited from the copied index (previously staged).
         for spec in exclude:
             _run_git(
                 ["rm", "-r", "--cached", "--quiet", "--ignore-unmatch", "--", spec],
