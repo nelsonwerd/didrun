@@ -110,6 +110,48 @@ def test_tree_delta_reports_exact_path(repo: Path, tmp_path: Path):
     assert "calc.py" in paths
 
 
+def test_objects_dir_is_the_real_db_in_a_linked_worktree(repo: Path, tmp_path: Path, git):
+    """The object alternates must resolve to a REAL directory in a worktree.
+
+    Regression, and the exact trap this asserts: in a linked worktree
+    ``--git-dir`` is ``.git/worktrees/<name>/``, which contains NO ``objects/``.
+    The alternates were built as ``git_dir()/objects``, so they named a
+    directory that does not exist; git then cannot resolve blobs it did not
+    re-hash, ``write-tree`` dies ("invalid object ... fatal: git-write-tree"),
+    and the digest degrades to None → every claim `unknown`. Agents run in
+    worktrees constantly, so this silently disabled didrun there.
+    """
+    wt = tmp_path / "linked-wt"
+    git(repo, "worktree", "add", "-q", "-b", "wt-branch", str(wt))
+
+    # The trap, asserted directly: the old expression names a missing dir...
+    assert not (gp.git_dir(wt) / "objects").exists()
+    # ...while the common dir is the real, shared object DB.
+    assert gp.objects_dir(wt).is_dir()
+    assert gp.objects_dir(wt) == gp.objects_dir(repo)
+
+
+def test_digest_in_linked_worktree(repo: Path, tmp_path: Path, git):
+    """Worktree digests work and still see dirt.
+
+    Note: this exercises the worktree path but does NOT by itself reproduce the
+    alternates bug — in a small fresh worktree `add -A` re-hashes every blob into
+    the ledger, so the alternates are never consulted and a broken path goes
+    unnoticed. Reproducing needs a stat-cache hit (an unchanged file whose blob
+    lives only in the main DB), which is why the assertion above targets the
+    resolved path directly rather than trusting this to fail.
+    """
+    wt = tmp_path / "dirty-wt"
+    git(repo, "worktree", "add", "-q", "-b", "dirty-branch", str(wt))
+    ledger_obj = tmp_path / "wt-ledger-obj"
+
+    clean = gp.tree_digest(wt, ledger_obj)
+    assert clean is not None
+    (wt / "calc.py").write_text("def add(a, b):\n    return a + b  # edit\n")
+    dirty = gp.tree_digest(wt, ledger_obj)
+    assert dirty is not None and dirty != clean
+
+
 def test_add_failure_returns_none_not_partial(repo: Path, monkeypatch):
     """A failed `git add` must yield None (→ unknown), never a partial tree."""
     real = gp._run_git

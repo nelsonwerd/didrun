@@ -76,6 +76,27 @@ def git_dir(repo: Path) -> Path:
     return gd if gd.is_absolute() else (repo / gd)
 
 
+def git_common_dir(repo: Path) -> Path:
+    """The *shared* git dir — where the real object DB lives.
+
+    Same lesson as ``index_path``: never hardcode ``.git``. In a linked worktree
+    ``--git-dir`` is ``.git/worktrees/<name>/``, which has NO ``objects/`` — the
+    objects are in the common dir. Pointing the object alternates at
+    ``git_dir()/objects`` therefore names a nonexistent directory in a worktree,
+    write-tree cannot resolve existing blobs, and the digest silently degrades to
+    ``None`` (→ every claim `unknown`). Identical to ``--git-dir`` in a normal
+    repo, so this is only ever a no-op or a fix.
+    """
+    proc = _run_git(["rev-parse", "--git-common-dir"], repo)
+    gd = Path(proc.stdout.strip())
+    return gd if gd.is_absolute() else (repo / gd)
+
+
+def objects_dir(repo: Path) -> Path:
+    """The real object DB — correct in both normal repos and linked worktrees."""
+    return git_common_dir(repo) / "objects"
+
+
 def index_path(repo: Path) -> Path:
     """Resolve the index via plumbing — never hardcode ``.git/index``.
 
@@ -154,7 +175,7 @@ def tree_digest(
             ledger_objects = Path(ledger_objects)
             ledger_objects.mkdir(parents=True, exist_ok=True)
             env["GIT_OBJECT_DIRECTORY"] = str(ledger_objects)
-            env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(git_dir(repo) / "objects")
+            env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(objects_dir(repo))
 
         # Stage everything into the throwaway index. If this fails, we must NOT
         # write a partial tree — a partial tree would silently under-report dirt.
@@ -210,7 +231,7 @@ def tree_delta(
     env = {}
     if ledger_objects is not None:
         env["GIT_OBJECT_DIRECTORY"] = str(ledger_objects)
-        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(git_dir(repo) / "objects")
+        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(objects_dir(repo))
     proc = _run_git(
         ["diff-tree", "-r", "--no-commit-id", "--name-status", tree_a, tree_b],
         repo,
