@@ -6,7 +6,14 @@ from dataclasses import dataclass
 
 from didrun import redact
 from didrun import render
-from didrun.claims import GradeResult, Claim
+from didrun.claims import (
+    ENV_DRIFT,
+    ENV_INCOMPARABLE,
+    ENV_MATCH,
+    ENV_NOT_RECORDED,
+    GradeResult,
+    Claim,
+)
 from didrun.gitplumbing import PathChange
 
 
@@ -35,16 +42,20 @@ def test_benign_git_hash_not_flagged():
 
 def test_redact_replaces_with_marker():
     text = "token sk-ABCDEFGHIJKLMNOPQRSTUVWX here"
-    out, findings = redact.redact(text)
-    assert findings
-    assert "sk-ABCDEFGHIJKLMNOPQRSTUVWX" not in out
-    assert "redacted" in out
+    result = redact.redact(text)
+    assert result.findings
+    assert "sk-ABCDEFGHIJKLMNOPQRSTUVWX" not in result.text
+    assert "redacted" in result.text
 
 
 # --- render helpers ----------------------------------------------------------
 
 def _report(results, all_verified=False, worst="stale", chain="intact",
-            chain_index=None, chain_why=""):
+            chain_index=None, chain_why="", require_env_match=False):
+    # Bound outside the class body on purpose: a class-body default may not read
+    # a name the class body itself also assigns (LOAD_NAME, not LOAD_CLASSDEREF).
+    gating = require_env_match
+
     @dataclass
     class R:
         commit: str = "abcdef123456"
@@ -61,10 +72,20 @@ def _report(results, all_verified=False, worst="stale", chain="intact",
         chain_status: str = chain
         chain_broken_index: object = chain_index
         chain_reason: str = chain_why
+        # Mirrors VerifyReport's environment fields, for the same reason.
+        require_env_match: bool = gating
 
         @property
         def worst_status(self):
             return worst
+
+        @property
+        def env_counts(self):
+            counts = {ENV_MATCH: 0, ENV_DRIFT: 0, ENV_INCOMPARABLE: 0,
+                      ENV_NOT_RECORDED: 0}
+            for r in self.results:
+                counts[r.env_status] = counts.get(r.env_status, 0) + 1
+            return counts
 
         @property
         def all_verified(self):

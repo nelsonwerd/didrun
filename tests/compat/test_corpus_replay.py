@@ -298,10 +298,15 @@ def test_leg1_chain_recompute(replay_source):
 # coded per manifest version so a new manifest field is a deliberate one-line
 # diff here and never a silent pass.
 # v2 introduced no top-level manifest key — the evidence binding lives inside
-# each claim entry — so its allowlist is v1's.
+# each claim entry.
+# `secrets` is P3.2's: the scan-domain record beside `secrets_override`. It is
+# additive with a v1-reproducing default ({}), so a stored note of EITHER
+# version legitimately lacks it, and both allowlists carry it. This entry is
+# the deliberate one-line diff the criterion exists to force — without it the
+# round-trip leg would go red across every stored note at once.
 MANIFEST_ADDITIVE_KEYS = {
-    1: frozenset({"secrets_override"}),
-    2: frozenset({"secrets_override"}),
+    1: frozenset({"secrets_override", "secrets"}),
+    2: frozenset({"secrets_override", "secrets"}),
 }
 
 

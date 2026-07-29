@@ -11,19 +11,39 @@ gc-durability. Commits are never rewritten.
 Verify resolves a manifest by commit id, falls back to tree id, recomputes the
 grades, and returns a structured report with CI-friendly exit semantics. It is a
 pre-merge / PR-head tool: squash-merged trees grade stale/unknown by design.
+
+The note is the only artifact that leaves the machine, so the redaction it
+carries is declared rather than inferred: each claim entry gets a `redaction`
+block naming the projection version, the detector-set version, and the exact
+source spans that were replaced. A consumer reads that block. The marker string
+alone is NOT authenticating — a recorded argv can contain the literal text
+`«redacted:openai-key»` and nothing escapes it — so "is this a real redaction or
+did the command print that?" is answered by `redaction.applied`, never by
+pattern-matching the preview. Keyed markers would close the forgery gap; they
+are out of scope (see docs/COMPAT.md).
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from .ledger import Session, canonical_json, _append_lock, _open_private_append
-from .claims import GRADE_WITNESS_UNAVAILABLE, Claim, GradeResult, grade
-from . import gitplumbing, redact
+from .claims import (
+    ENV_DRIFT,
+    ENV_INCOMPARABLE,
+    ENV_MATCH,
+    ENV_NOT_RECORDED,
+    GRADE_WITNESS_UNAVAILABLE,
+    Claim,
+    GradeResult,
+    grade,
+)
+from . import capture, gitplumbing, redact
 
 # 2: a claim may carry an `evidence` block naming the recorded entry that backed
 # it, and verify CHECKS that binding instead of regrading by index alone. The
@@ -46,6 +66,11 @@ class Manifest:
     claims: list[dict]  # graded results (serialized)
     coverage: dict
     secrets_override: bool = False
+    # What the secrets pass actually looked at. `secrets_override: false` used
+    # to be unfalsifiable — it is the same word for "nothing was found" and
+    # "almost nothing was scanned". This says which. Additive, defaults to {},
+    # read with .get(): no MANIFEST_VERSION bump (docs/COMPAT.md).
+    secrets: dict = field(default_factory=dict)
 
     def to_json(self) -> bytes:
         return canonical_json(
@@ -56,6 +81,7 @@ class Manifest:
                 "claims": self.claims,
                 "coverage": self.coverage,
                 "secrets_override": self.secrets_override,
+                "secrets": self.secrets,
             }
         )
 
@@ -83,6 +109,7 @@ class Manifest:
             claims=d["claims"],
             coverage=d["coverage"],
             secrets_override=d.get("secrets_override", False),
+            secrets=d.get("secrets", {}),
         )
 
 
@@ -128,8 +155,12 @@ def seal(
 ) -> Manifest:
     """Compile, redact, and attach a manifest for ``commitish``.
 
-    Raises ``redact.SecretsBlocked`` if secrets are found and ``allow_secrets``
-    is False. On override, the exported artifact is still redacted and the
+    Raises ``redact.SecretsBlocked`` if a BLOCK-tier detector fires on the
+    EXPORT domain and ``allow_secrets`` is False. Notice-tier findings, and
+    block-tier findings confined to the local output blobs, warn loudly on
+    stderr and do not stop the seal — the blobs stay in a gitignored ledger and
+    are not published, so refusing over them stopped work without protecting
+    anything. On override, the exported artifact is still redacted and the
     override is recorded in the manifest.
     """
     repo = Path(repo)
@@ -164,18 +195,57 @@ def seal(
 
     _gc_durable_copy(session, results)
 
-    # Secrets pass over argv + backing output blobs before anything is exported.
-    findings = _scan_for_secrets(session, results)
-    if findings and not allow_secrets:
-        raise redact.SecretsBlocked(findings)
+    # Secrets pass. The export domain is compiled FIRST so the scan runs over
+    # the bytes that would actually be published — claim labels and delta paths
+    # included, which the argv+blobs scan never covered. Nothing is written
+    # until this clears: a blocked seal must leave the watermark and the note
+    # exactly where they were, which is what makes retrying one free.
+    #
+    # The two fields absent here are the two this pass GENERATES —
+    # `secrets_override` and `secrets` — and they are the scan's own counters,
+    # versions and booleans, never operator- or command-authored text. Every
+    # field that carries content from outside is in these bytes, and a field
+    # added later is in them too, without anyone remembering to add it.
+    #
+    # Compiling the export domain also REDACTS it, and the findings that come
+    # back are what the gate blocks on. A field cannot be blocked-but-published
+    # (the label bug) or published-but-unscanned, because one pass does both.
+    redacted = [
+        _redact_result(r, session, entries, claim_index=i)
+        for i, r in enumerate(results)
+    ]
+    claims_payload = [rc.payload for rc in redacted]
+    field_findings = [f for rc in redacted for f in rc.findings]
+    field_bytes = sum(rc.bytes_scanned for rc in redacted)
+    coverage = _coverage_statement(session)
+    export_bytes = canonical_json(
+        {
+            "version": MANIFEST_VERSION,
+            "commit": commit,
+            "tree": tree,
+            "claims": claims_payload,
+            "coverage": coverage,
+        }
+    )
+    scan = _scan_for_secrets(
+        session, results, export_bytes, field_findings, field_bytes
+    )
+    if scan.blocking and not allow_secrets:
+        raise redact.SecretsBlocked(scan.blocking)
+    _warn_unblocked_secrets(scan)
 
+    # `secrets_override` keeps its exact v0.1 meaning: "this seal would have
+    # been refused and the operator overrode it". The set that would refuse is
+    # the blocking set, which is what `findings` denoted before tiering existed.
+    overridden = bool(scan.blocking) and allow_secrets
     manifest = Manifest(
         version=MANIFEST_VERSION,
         commit=commit,
         tree=tree,
-        claims=[_redact_result(r, session, entries) for r in results],
-        coverage=_coverage_statement(session),
-        secrets_override=bool(findings) and allow_secrets,
+        claims=claims_payload,
+        coverage=coverage,
+        secrets_override=overridden,
+        secrets=scan.to_dict(overridden),
     )
 
     # Publication and the watermark are one atomic pair. A published note with
@@ -232,6 +302,12 @@ class VerifyReport:
     chain_status: str = "absent"  # intact | broken | unverifiable | empty | absent
     chain_broken_index: Optional[int] = None  # set only when status is "broken"
     chain_reason: str = ""
+    # Whether environment drift REFUSES rather than reports. Off by default:
+    # drift is a statement about this machine now, not about whether the
+    # recorded command ran, so making it fail --strict silently would flip green
+    # units red on routine noise. The flag is recorded on the report so a reader
+    # can tell which of the two verdicts they are looking at.
+    require_env_match: bool = False
 
     @property
     def chain_faulted(self) -> bool:
@@ -266,11 +342,43 @@ class VerifyReport:
         # Membership is deliberately NOT widened. `witness-unavailable` reports
         # a grade this run did not check, so admitting it here would make
         # --strict pass on evidence nobody has seen.
+        #
+        # Environment drift subtracts from this set ONLY under
+        # --require-env-match. `incomparable` never does, under either mode: it
+        # is the state every archived v1 note lands in, and refusing on it would
+        # turn "this note predates the current fingerprint" into a failure.
         if self.chain_faulted:
             return False
-        return bool(self.results) and all(
-            r.grade in ("tree-exact", "scope-exact") for r in self.results
-        )
+        if not self.results:
+            return False
+        for r in self.results:
+            if r.grade not in ("tree-exact", "scope-exact"):
+                return False
+            if self.require_env_match and r.env_status == ENV_DRIFT:
+                return False
+        return True
+
+    @property
+    def env_counts(self) -> dict:
+        """How the sealed environment fingerprints compared, by state.
+
+        Always all four keys, including zeros: "0 drifted" and "not checked"
+        are different facts, and a counter that disappears when it is zero
+        cannot say the first one.
+        """
+        counts = {
+            ENV_MATCH: 0,
+            ENV_DRIFT: 0,
+            ENV_INCOMPARABLE: 0,
+            ENV_NOT_RECORDED: 0,
+        }
+        for r in self.results:
+            counts[r.env_status] = counts.get(r.env_status, 0) + 1
+        return counts
+
+    @property
+    def env_drift_count(self) -> int:
+        return self.env_counts[ENV_DRIFT]
 
     @property
     def evidence_bound_count(self) -> int:
@@ -287,11 +395,23 @@ class VerifyReport:
         return len(self.results)
 
 
-def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyReport:
+def verify(
+    session: Session,
+    repo: Path,
+    commitish: str = "HEAD",
+    require_env_match: bool = False,
+) -> VerifyReport:
     """Resolve and re-grade a manifest for ``commitish``.
 
     Resolves by commit id, then by tree id (survives amend/rebase). Degrades a
     claim to unknown ("referenced object gc'd") rather than erroring.
+
+    The sealed environment fingerprint is compared against this process's, once
+    per verify. That comparison is ACROSS TIME, which is the only axis on which
+    it says anything: comparing the fingerprints within a claim's own events is
+    vacuous, because every claim didrun's CLI can declare binds exactly one
+    event and one event trivially agrees with itself. Drift is reported and does
+    not change the verdict unless ``require_env_match`` is set.
 
     A claim the note bound to a specific recorded entry is only regraded when
     the live ledger still holds that entry; otherwise the sealed grade is
@@ -325,6 +445,7 @@ def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyRepor
             chain_status=chain_status,
             chain_broken_index=chain_index,
             chain_reason=chain_reason,
+            require_env_match=require_env_match,
         )
 
     # Re-grade the MANIFEST'S OWN claims against its sealed tree (deterministic
@@ -334,12 +455,24 @@ def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyRepor
     entries = list(session.entries())
     events = [e.event for e in entries]
     ledger_objects = session.blobs.root
+    # Once per verify, not once per claim: it is a property of this process, and
+    # reading the umask inside it is a read-modify-write (capture.process_umask).
+    current_fingerprint = capture.env_fingerprint()
     results: list[GradeResult] = []
     for c in manifest.claims:
         claim = Claim.from_dict(c["claim"])
-        results.append(
-            _verify_claim(c, claim, manifest, entries, events, repo, ledger_objects)
+        result = _verify_claim(
+            c, claim, manifest, entries, events, repo, ledger_objects
         )
+        # Assigned around the ladder, like witness-unavailable: the environment
+        # comparison is a fact about this run, not a grade the evidence earns.
+        # It is set on EVERY path, including witness-unavailable — the sealed
+        # fingerprint is in the note whether or not the ledger still holds the
+        # entry it names.
+        result.env_status, result.env_reason = _env_comparison(
+            c.get("evidence"), current_fingerprint
+        )
+        results.append(result)
     return VerifyReport(
         commit=manifest.commit,
         tree=manifest.tree,
@@ -351,6 +484,89 @@ def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyRepor
         chain_status=chain_status,
         chain_broken_index=chain_index,
         chain_reason=chain_reason,
+        require_env_match=require_env_match,
+    )
+
+
+def _env_comparison(evidence, current: str) -> tuple[str, str]:
+    """Compare the fingerprint the seal recorded against this process's.
+
+    Four outcomes, and three of them are refusals to compare. The refusals are
+    the reason this is safe to add to a tool with sealed evidence already in the
+    world: a note that bound no fingerprint, a bare v0.1 digest, and a
+    fingerprint written under a different FINGERPRINT_VERSION are all cases
+    where the two strings are not measurements of the same thing. Reporting any
+    of them as drift would make every note published before this unit look like
+    the environment moved.
+
+    Only the GATE portion is compared. A `path=` difference is appended as an
+    advisory to whatever the gate said — never promoted to drift, and never able
+    to turn a match into one.
+    """
+    if not isinstance(evidence, dict):
+        return (
+            ENV_NOT_RECORDED,
+            "this note bound no environment fingerprint to the claim",
+        )
+    sealed = evidence.get("env_fingerprint")
+    if not isinstance(sealed, str) or not sealed:
+        return (
+            ENV_NOT_RECORDED,
+            "the sealed evidence block carries no environment fingerprint",
+        )
+
+    sealed_version = capture.fingerprint_version(sealed)
+    current_version = capture.fingerprint_version(current)
+    if sealed_version is None:
+        return (
+            ENV_INCOMPARABLE,
+            "the sealed fingerprint is an unversioned v0.1 digest, which is "
+            "incomparable with this one — not evidence that anything drifted",
+        )
+    if current_version is None or sealed_version != current_version:
+        return (
+            ENV_INCOMPARABLE,
+            f"the sealed fingerprint is version {sealed_version} and this didrun "
+            f"computes version {current_version}; different key sets are "
+            "incomparable, not drifted",
+        )
+
+    sealed_gate = capture.fingerprint_gate(sealed)
+    current_gate = capture.fingerprint_gate(current)
+    if sealed_gate is None or current_gate is None:
+        return (
+            ENV_INCOMPARABLE,
+            "a fingerprint carries no readable gate portion to compare",
+        )
+
+    advisory = _path_advisory(sealed, current)
+    if sealed_gate == current_gate:
+        return ENV_MATCH, advisory
+    drifted = (
+        f"environment changed since seal (sealed gate {sealed_gate}, "
+        f"now {current_gate})"
+    )
+    return ENV_DRIFT, f"{drifted}; {advisory}" if advisory else drifted
+
+
+def _path_advisory(sealed: str, current: str) -> str:
+    """PATH drift, as text. Never a gate, never drift, never a verdict.
+
+    PATH varies with terminal tab, direnv, `nix develop`, tmux and homebrew
+    shellenv ordering, so gating on it produces a refusal that fires in a new
+    shell and is ignored within a week. It is recorded as its own digest so the
+    variation stays visible to a reader who is looking for it.
+
+    Digests, not values: what changed is not said, because saying it would put a
+    developer machine's PATH in a published note.
+    """
+    sealed_path = capture.fingerprint_path_digest(sealed)
+    current_path = capture.fingerprint_path_digest(current)
+    if not sealed_path or not current_path or sealed_path == current_path:
+        return ""
+    return (
+        f"PATH differs (sealed path={sealed_path}, now path={current_path}) — "
+        "recorded, not gated"
     )
 
 
@@ -711,31 +927,237 @@ def _resolve_manifest(
     return None, "none", skipped
 
 
-def _scan_for_secrets(session: Session, results: list[GradeResult]) -> list[redact.Finding]:
-    findings: list[redact.Finding] = []
+# What the secrets pass looked at, published so `secrets_override: false` is a
+# checkable statement rather than the same word for "nothing found" and
+# "almost nothing looked at". `claim-fields` is the label, the pathspecs and
+# the changed paths: they used to ride into the scan only inside the
+# serialized manifest, where they blocked a seal and were published anyway.
+SCAN_DOMAIN = "claim-bound-events+claim-fields+manifest"
+
+
+@dataclass
+class SecretsScan:
+    """What the secrets pass looked at, and what it found where.
+
+    Two domains, and the distinction is the whole point. ``export`` is what is
+    about to leave the machine: the argv of each claim-bound event and the
+    serialized manifest bytes themselves. ``local`` is what stays: the stdout
+    and stderr blobs, which live in a gitignored ledger and are never published.
+    Blocking a seal over bytes that never leave, while publishing claim labels
+    and delta paths entirely unscanned, was the gate pointed at the wrong half.
+    """
+
+    export: list  # findings in bytes about to be written
+    local: list  # findings in blobs that stay on this machine
+    events_scanned: int
+    events_total: int
+    bytes_scanned: int
+
+    @property
+    def blocking(self) -> list:
+        """The findings that stop a seal: block-tier, in the export domain."""
+        return [f for f in self.export if f.tier == redact.TIER_BLOCK]
+
+    @property
+    def non_blocking(self) -> list:
+        """Everything found that did not stop the seal — reported, not silent."""
+        return [f for f in self.export if f.tier != redact.TIER_BLOCK] + list(self.local)
+
+    @property
+    def all_findings(self) -> list:
+        return self.export + self.local
+
+    def to_dict(self, overridden: bool) -> dict:
+        by_tier = {tier: 0 for tier in redact.TIERS}
+        for f in self.all_findings:
+            by_tier[f.tier] = by_tier.get(f.tier, 0) + 1
+        return {
+            "scan_domain": SCAN_DOMAIN,
+            "events_scanned": self.events_scanned,
+            "events_total": self.events_total,
+            "bytes_scanned": self.bytes_scanned,
+            "detector_set_version": redact.DETECTOR_SET_VERSION,
+            "findings_by_tier": by_tier,
+            "blocked": bool(self.blocking),
+            "overridden": overridden,
+        }
+
+
+def _scan_for_secrets(
+    session: Session,
+    results: list[GradeResult],
+    export_bytes: bytes,
+    field_findings: Optional[list] = None,
+    field_bytes: int = 0,
+) -> SecretsScan:
+    """Scan both domains, tagging every finding with where it is.
+
+    Three contributions make up the export domain, and they are deliberately
+    not the same mechanism:
+
+    * the argv of each claim-bound event, scanned RAW here and redacted into
+      the published `argv_preview` separately;
+    * ``field_findings`` — the claim fields (label, pathspecs, changed paths),
+      which arrive already located from the pass that redacted them, so what
+      blocks and what is scrubbed cannot drift apart;
+    * ``export_bytes``, the serialized manifest as it would be published,
+      scanned WHOLE rather than field by field. It is the backstop: a field a
+      later version adds and forgets to redact is still in these bytes, so it
+      still blocks. The redacted fields are already markers by the time they
+      get here, so nothing is counted twice.
+
+    The scan covers each claim's supporting event once, not once per claim, so
+    ``events_scanned`` counts events rather than claim-event pairs.
+    """
+    export: list[redact.Finding] = list(field_findings or ())
+    local: list[redact.Finding] = []
     events = session.events()
+    seen: set = set()
+    # Starts at the claim-field bytes rather than 0: those bytes were scanned,
+    # by the redaction pass, and a published counter that omitted them would be
+    # the same "checkable statement that is not true" this block exists to fix.
+    bytes_scanned = field_bytes
+
     for r in results:
         idx = r.supporting_event_index
-        if idx is None or not (0 <= idx < len(events)):
+        if idx is None or not (0 <= idx < len(events)) or idx in seen:
             continue
+        seen.add(idx)
         ev = events[idx]
-        findings.extend(redact.scan(" ".join(ev.argv)))
-        for blob in (ev.stdout_blob, ev.stderr_blob):
+        for argv_index, arg in enumerate(ev.argv):
+            bytes_scanned += len(arg.encode("utf-8", "replace"))
+            export.extend(
+                redact.scan(
+                    arg,
+                    redact.FindingSource(
+                        "argv", event_index=idx, argv_index=argv_index
+                    ),
+                )
+            )
+        for stream, blob in (("stdout", ev.stdout_blob), ("stderr", ev.stderr_blob)):
             if blob and session.blobs.has(blob):
-                findings.extend(redact.scan(session.blobs.get(blob)))
-    return findings
+                data = session.blobs.get(blob)
+                bytes_scanned += len(data)
+                local.extend(
+                    redact.scan(data, redact.FindingSource(stream, event_index=idx))
+                )
+
+    bytes_scanned += len(export_bytes)
+    export.extend(redact.scan(export_bytes, redact.FindingSource("manifest")))
+
+    return SecretsScan(
+        export=export,
+        local=local,
+        events_scanned=len(seen),
+        events_total=len(events),
+        bytes_scanned=bytes_scanned,
+    )
 
 
-def _redact_result(r: GradeResult, session: Session, entries: list) -> dict:
+def _warn_unblocked_secrets(scan: SecretsScan) -> None:
+    """Say, loudly, what was found and not blocked on.
+
+    Silence here would make the tiering a suppression list with extra steps.
+    Notice-tier findings and block-tier findings confined to local blobs do not
+    stop a seal, but the operator is told they exist and where they are.
+    """
+    findings = scan.non_blocking
+    if not findings:
+        return
+    notice = sum(1 for f in findings if f.tier == redact.TIER_NOTICE)
+    local_block = len(findings) - notice
+    print(
+        f"didrun seal: WARNING: {len(findings)} secret finding(s) did not block "
+        f"this seal ({notice} notice-tier, {local_block} block-tier in local "
+        f"output blobs that are not exported):",
+        file=sys.stderr,
+    )
+    for line in redact.enumerate_findings(findings):
+        print(line, file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class RedactedClaim:
+    """One exported claim entry, plus what redacting it found.
+
+    ``findings`` is not diagnostic output: it is the export gate's input for
+    every field of this claim that is not argv. Producing the two together is
+    the only reason the gate cannot disagree with the publication again.
+    ``bytes_scanned`` keeps the manifest's published byte count honest about
+    the fields this pass added to the domain.
+    """
+
+    payload: dict
+    findings: list
+    bytes_scanned: int = 0
+
+
+def _redact_result(
+    r: GradeResult, session: Session, entries: list, claim_index: int = 0
+) -> RedactedClaim:
     d = r.to_dict()
-    # Redact argv in the exported claim view.
-    d["claim"]["argv_preview"] = redact.scrub_argv(
+    # Redact argv in the exported claim view, and DECLARE the projection that
+    # produced it. The marker string alone is not authenticating — a recorded
+    # argv may contain the literal marker text — so a consumer distinguishes a
+    # real redaction from literal text by reading `redaction.applied`, which
+    # names the source spans that were replaced. Additive, read with .get():
+    # no MANIFEST_VERSION bump (docs/COMPAT.md).
+    argv_redaction = redact.redact_argv(
         list(_event_argv(session, r.supporting_event_index))
     )
+    d["claim"]["argv_preview"] = argv_redaction.argv
+
+    # The rest of the published claim. argv used to be the only field scrubbed
+    # here, which made the seal's own refusal message ("re-run with
+    # --allow-secrets to export a redacted artifact anyway") false for every
+    # other field: a token in a claim label BLOCKED the seal and was then
+    # published verbatim into refs/notes/didrun on the override. These are the
+    # exported strings that carry operator- or repository-authored text, and
+    # each one is redacted by the same pass that reports it.
+    fields: list[dict] = []
+    findings: list = []
+    scanned = 0
+
+    def _field(name: str, kind: str, value: str) -> str:
+        nonlocal scanned
+        scanned += len(value.encode("utf-8", "replace"))
+        redaction = redact.redact_field(
+            name,
+            value,
+            redact.FindingSource(kind, claim_index=claim_index),
+        )
+        fields.extend(redaction.applied)
+        findings.extend(redaction.findings)
+        return redaction.text
+
+    d["claim"]["label"] = _field("claim.label", "label", d["claim"]["label"])
+    d["claim"]["pathspecs"] = [
+        _field(f"claim.pathspecs[{i}]", "pathspec", spec)
+        for i, spec in enumerate(d["claim"]["pathspecs"])
+    ]
+    d["delta"] = [
+        {
+            "status": change["status"],
+            "path": _field(f"delta[{i}].path", "delta-path", change["path"]),
+        }
+        for i, change in enumerate(d["delta"])
+    ]
+
+    d["redaction"] = {
+        "projection_version": redact.PROJECTION_VERSION,
+        "detector_set_version": redact.DETECTOR_SET_VERSION,
+        "applied": argv_redaction.applied,
+        # Additive and separate from `applied`, which stays argv-addressed by
+        # `argv_index` exactly as v0.2 consumers already read it. Entries here
+        # are addressed by field name instead, because a label has no argv
+        # index. A reader that does not know this key sees the same argv
+        # projection it always did.
+        "fields": fields,
+    }
     block = _evidence_block(entries, r.supporting_event_index)
     if block is not None:
         d["evidence"] = block
-    return d
+    return RedactedClaim(payload=d, findings=findings, bytes_scanned=scanned)
 
 
 def _evidence_block(entries: list, idx: Optional[int]) -> Optional[dict]:

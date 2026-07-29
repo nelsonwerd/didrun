@@ -257,8 +257,15 @@ def test_happy_path_cli_still_exits_zero(repo: Path):
 
 
 def test_manifest_json_bytes_are_pinned():
-    """The manifest's on-the-wire bytes are compat surface across 65 sealed
-    notes. This seal change moves no note byte; a `to_json` tidy-up would.
+    """The manifest's on-the-wire bytes are compat surface across every sealed
+    note. A `to_json` tidy-up would move them silently; this pin makes any move
+    a deliberate diff.
+
+    P3.2 adds exactly one key, `secrets`, whose default is `{}`. Every key a
+    stored note carries still comes back with an equal value, so the addition
+    is additive with a v1-reproducing default — which is why this is a one-line
+    diff here plus a one-line diff in the compat allowlist, and not a
+    MANIFEST_VERSION bump.
     """
     m = M.Manifest(
         version=1,
@@ -290,6 +297,6 @@ def test_manifest_json_bytes_are_pinned():
         b'"supporting_event_index":0}],'
         b'"commit":"0000000000000000000000000000000000000000",'
         b'"coverage":{"by_coverage":{"complete":1},"total_events":1},'
-        b'"secrets_override":false,'
+        b'"secrets":{},"secrets_override":false,'
         b'"tree":"1111111111111111111111111111111111111111","version":1}'
     )

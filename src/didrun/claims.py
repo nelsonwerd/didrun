@@ -54,6 +54,21 @@ GRADE_FAILED = "failed"
 # is never admitted to the set --strict accepts.
 GRADE_WITNESS_UNAVAILABLE = "witness-unavailable"
 
+# The environment comparison verify makes ACROSS TIME — between the fingerprint
+# the seal recorded and the one this process computes. These are NOT grades: a
+# drifted environment does not make a recorded command un-run, so they never
+# enter the grading ladder and never reach `worst_status`.
+#
+# The two refusals are load-bearing. `incomparable` is what a fingerprint from a
+# different FINGERPRINT_VERSION (or a bare v0.1 digest) gets — different key
+# sets are not measuring the same thing, and calling that drift would make every
+# archived note look like the environment moved. `not-recorded` is a note that
+# bound no fingerprint at all, which is a different fact again.
+ENV_MATCH = "match"
+ENV_DRIFT = "env-drift-since-seal"
+ENV_INCOMPARABLE = "incomparable"
+ENV_NOT_RECORDED = "not-recorded"
+
 
 class ClaimError(Exception):
     """A claim declaration violated an invariant."""
@@ -108,6 +123,11 @@ class GradeResult:
     facts: they say whether this verdict was checked against the specific
     recorded entry the seal named, and what that seal graded. ``grade()`` never
     sets them, so a sealed note carries them at their defaults.
+
+    ``env_status`` / ``env_reason`` are verify-side in the same way, and they
+    are deliberately NOT in ``to_dict``: the seal has nothing to compare against
+    itself, so writing them would put a permanently-default key in every
+    published note.
     """
 
     claim: Claim
@@ -118,6 +138,8 @@ class GradeResult:
     exit_code: Optional[int] = None
     evidence_bound: bool = False
     sealed_grade: Optional[str] = None
+    env_status: str = ENV_NOT_RECORDED
+    env_reason: str = ""
 
     def to_dict(self) -> dict:
         return {

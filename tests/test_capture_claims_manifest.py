@@ -316,7 +316,10 @@ def test_cli_refuses_a_future_note_as_a_message_not_a_traceback(repo: Path, caps
 
 
 def test_env_fingerprint_carries_its_version_in_band():
-    assert re.fullmatch(r"v1:[0-9a-f]{16}", capture.env_fingerprint({"PATH": "/bin"}))
+    # The shape is pinned in tests/test_env_fingerprint.py, which owns the v2
+    # contract; what this asserts is that the version is READABLE off the wire
+    # and that an unversioned v0.1 digest still reports as unversioned.
+    assert capture.fingerprint_version(capture.env_fingerprint({"PATH": "/bin"})) == 2
     assert capture.fingerprint_version("v1:0123456789abcdef") == 1
     # A bare v0.1 digest: incomparable with a versioned one, not drifted.
     assert capture.fingerprint_version("0123456789abcdef") is None
@@ -324,14 +327,14 @@ def test_env_fingerprint_carries_its_version_in_band():
 
 def test_env_fingerprint_is_deterministic_and_env_sensitive():
     """Determinism is a trust-path invariant; sensitivity is the point of the
-    field. No hard-coded digest — the key set changes in a later unit."""
+    field. No hard-coded digest — the key set has changed once already."""
     env = {"PATH": "/usr/bin", "SHELL": "/bin/zsh", "LANG": "C"}
     assert capture.env_fingerprint(env) == capture.env_fingerprint(dict(env))
-    assert capture.env_fingerprint({**env, "PATH": "/usr/local/bin"}) != capture.env_fingerprint(env)
+    assert capture.env_fingerprint({**env, "SHELL": "/bin/bash"}) != capture.env_fingerprint(env)
 
 
 def test_recorded_events_carry_the_versioned_fingerprint(repo: Path):
     """The prefix reaches the ledger, not just the helper's return value."""
     s = _session(repo)
     ev = run_wrapped([sys.executable, "-c", "print(1)"], s, repo)
-    assert capture.fingerprint_version(ev.env_fingerprint) == 1
+    assert capture.fingerprint_version(ev.env_fingerprint) == 2

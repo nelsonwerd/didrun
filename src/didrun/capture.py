@@ -32,17 +32,50 @@ from typing import Callable, Optional
 from .ledger import Event, Session
 from . import gitplumbing
 
-# Environment variables whose presence/identity is safe to fingerprint. We hash
-# a sorted allowlist rather than the raw environment so the fingerprint never
-# leaks a secret (redaction of captured *output* is a separate pass; see redact.py).
-_ENV_FINGERPRINT_KEYS = ("PATH", "SHELL", "LANG", "PWD", "VIRTUAL_ENV")
+# The GATE: the environment facts whose identity is allowed to change a verdict.
+# We hash a declared allowlist rather than the raw environment so the
+# fingerprint never leaks a secret (redaction of captured *output* is a separate
+# pass; see redact.py) — every value here is digested, never stored.
+#
+# IN, because each of them changes what a build produces: the locale (LANG), the
+# shell a recipe may re-enter (SHELL), the active virtualenv (VIRTUAL_ENV), the
+# timezone (TZ, which moves every date a build stamps), and the process umask
+# (below — not an environment variable, but the same kind of fact, and the one
+# whose absence made two green wrapper events under different umasks
+# indistinguishable in the receipt).
+#
+# OUT, deliberately, and both were in v0.1's key set:
+#
+#   PATH  varies with terminal tab, direnv, `nix develop`, tmux and homebrew
+#         shellenv ordering, and flips on any venv activation VIRTUAL_ENV
+#         already records. A gate that refuses in a new shell is ignored within
+#         a week. It is recorded as its own digest instead (see
+#         env_fingerprint), so PATH drift stays inspectable without gating.
+#
+#   PWD   is NOT the child's cwd. run_wrapped always spawns with cwd=str(repo)
+#         and Event.cwd records that same resolved path; PWD is the caller's
+#         shell-maintained variable, which can be stale and can be absent when
+#         didrun is spawned by a launcher. While nothing read the fingerprint
+#         this was inert. The moment it is compared, PWD is a false-drift
+#         source: two byte-identical executions of the same command against the
+#         same repo, invoked from different directories, would disagree.
+_ENV_FINGERPRINT_KEYS = ("LANG", "SHELL", "TZ", "VIRTUAL_ENV")
 
 # The fingerprint's preimage is versioned IN BAND, because the digest's shape
 # does not change when its key set does: two 16-hex strings over different key
 # sets are silently incomparable, which reads as "the environment drifted" when
 # the truth is "these were produced by different didrun versions". A bare digest
 # with no prefix was produced by v0.1 and is incomparable, not drifted.
-FINGERPRINT_VERSION = 1
+#
+# 2: the key set changed (umask and TZ in, PATH and PWD out) AND the string
+# grew a `:path=` suffix. A v1 and a v2 value are never compared — see
+# manifest._env_comparison and docs/COMPAT.md.
+FINGERPRINT_VERSION = 2
+
+# The marker introducing the non-gated PATH digest in a v2 fingerprint.
+_PATH_MARKER = "path="
+
+_UMASK: Optional[int] = None
 
 # The env var that gates Tier-2 traps. The trap does nothing unless this is set,
 # and it is set ONLY by `didrun run`, so an installed trap never records an
@@ -50,14 +83,54 @@ FINGERPRINT_VERSION = 1
 DIDRUN_ACTIVE_ENV = "DIDRUN_SESSION"
 
 
-def env_fingerprint(env: Optional[dict] = None) -> str:
+def process_umask() -> int:
+    """This process's umask, read ONCE and reused for every event.
+
+    There is no read-only way to read a umask: the read is a read-modify-write
+    (``os.umask(0)`` then restore), and between the two calls this process's
+    umask is 0 — process-global state, not thread-local, so a sibling thread
+    forking in that window hands its child the wrong one. Reading once per
+    process opens that window once, before the first child is spawned, instead
+    of once per wrapped command. The umask is a property of the process, not of
+    the command, so re-reading it per event would buy nothing anyway.
+
+    ``run_wrapped`` primes this before spawning, so the value recorded on an
+    event is the umask the child actually inherited.
+    """
+    global _UMASK
+    if _UMASK is None:
+        old = os.umask(0)
+        os.umask(old)
+        _UMASK = old
+    return _UMASK
+
+
+def env_fingerprint(env: Optional[dict] = None, umask: Optional[int] = None) -> str:
+    """Digest the environment facts that can change what a build produces.
+
+    Returns ``v2:<16 hex gate>:path=<8 hex>``. The GATE is the only part a
+    comparison may read (``fingerprint_gate``); the ``path=`` digest records
+    PATH so its drift stays INSPECTABLE without becoming a gate — see
+    ``_ENV_FINGERPRINT_KEYS`` for why, and docs/COMPAT.md for why a digest and
+    not the raw string.
+
+    Every input is hashed and none is stored: the fingerprint must never become
+    the place where a secret-bearing environment variable lands verbatim in a
+    note. That is also why the whole environment is not fingerprinted, and it is
+    the reason an inherited-environment false green (``GOFLAGS=-exec=…``) is a
+    documented NON-guarantee rather than something this closes.
+    """
     env = env if env is not None else os.environ
-    parts = []
-    for key in _ENV_FINGERPRINT_KEYS:
-        val = env.get(key, "")
-        parts.append(f"{key}={val}")
-    digest = hashlib.sha256("\n".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
-    return f"v{FINGERPRINT_VERSION}:{digest}"
+    umask = process_umask() if umask is None else umask
+    parts = [f"{key}={env.get(key, '')}" for key in _ENV_FINGERPRINT_KEYS]
+    # Named like the env parts, so the preimage stays one readable list and a
+    # future key called "umask" could not collide with it silently.
+    parts.append(f"umask={umask:04o}")
+    gate = hashlib.sha256("\n".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
+    path_digest = hashlib.sha256(
+        env.get("PATH", "").encode("utf-8", "replace")
+    ).hexdigest()[:8]
+    return f"v{FINGERPRINT_VERSION}:{gate}:{_PATH_MARKER}{path_digest}"
 
 
 def fingerprint_version(value: str) -> Optional[int]:
@@ -66,14 +139,47 @@ def fingerprint_version(value: str) -> Optional[int]:
     ``None`` means the value came from a didrun that predates the prefix, so it
     is INCOMPARABLE with a versioned one — a consumer must not read a mismatch
     between the two as environment drift.
+
+    A v2 value carries a second colon (the ``:path=`` suffix); only the leading
+    ``v<N>`` field is read here, so both shapes parse.
     """
-    prefix, sep, _digest = value.partition(":")
+    prefix, sep, _rest = value.partition(":")
     if not sep or not prefix.startswith("v"):
         return None
     digits = prefix[1:]
     if not (digits.isascii() and digits.isdigit()):
         return None
     return int(digits)
+
+
+def fingerprint_gate(value: str) -> Optional[str]:
+    """The comparable portion of a fingerprint, or None when there is none.
+
+    ``None`` is INCOMPARABLE and a consumer must never report it as drift: it
+    means a bare v0.1 digest with no version prefix, or a value whose gate field
+    is empty. The ``:path=`` suffix is excluded on purpose — PATH is recorded to
+    be looked at, never to be gated on.
+    """
+    if fingerprint_version(value) is None:
+        return None
+    _prefix, _sep, rest = value.partition(":")
+    gate, _sep2, _suffix = rest.partition(":")
+    return gate or None
+
+
+def fingerprint_path_digest(value: str) -> Optional[str]:
+    """The non-gated PATH digest carried by a v2 fingerprint, or None.
+
+    Advisory only, in every consumer. A v1 fingerprint carries none, and a
+    difference here is reported as PATH drift, never as environment drift.
+    """
+    if fingerprint_version(value) is None:
+        return None
+    _prefix, _sep, rest = value.partition(":")
+    _gate, sep, suffix = rest.partition(":")
+    if not sep or not suffix.startswith(_PATH_MARKER):
+        return None
+    return suffix[len(_PATH_MARKER):] or None
 
 
 # --- Tier 0: the output pump --------------------------------------------------
@@ -530,6 +636,12 @@ def run_wrapped(
     repo = Path(repo or os.getcwd())
     ledger_objects = session.blobs.root  # digest objects live beside blobs
 
+    # Read the umask BEFORE the child is spawned, so the value the event records
+    # is the one the child inherited, and so the read-modify-write window this
+    # opens (see process_umask) is never concurrent with a fork. Cached from
+    # here on: the fingerprint below reuses it rather than re-reading.
+    process_umask()
+
     tree_before = gitplumbing.tree_digest(repo, ledger_objects)
     submod = gitplumbing.submodule_dirty(repo)
 
@@ -609,6 +721,10 @@ def pty_transcript(argv: list[str], session: Session, repo: Optional[Path] = Non
     carries no exit code — enforced by ledger.Event.
     """
     import pty
+
+    # Before pty.spawn, for the same reason run_wrapped primes it before Popen:
+    # the recorded umask must be the one the child inherited.
+    process_umask()
 
     repo = Path(repo or os.getcwd())
     chunks: list[bytes] = []

@@ -61,14 +61,46 @@ echoed: tokens, `.env` contents, connection strings. Treat `.didrun/` and any
 exported bundle as **secret-bearing**:
 
 - `.didrun/` is self-ignored (a `*` gitignore inside it) so it is never committed.
-- At `seal`/export, didrun scans argv and captured output for likely secrets and
-  **blocks export by default** if it finds any (override with `--allow-secrets`,
-  which is logged into the manifest, and still redacts the exported artifact).
+- At `seal`/export, didrun scans two domains and **tiers** what it finds. The six
+  structured detectors are `block`: they fire on shape and name what they found.
+  The entropy sweep is `notice`: it fires on "this looked random", which over a
+  24-character run is a statement about length far more than about secrecy.
+- **A seal is refused only for a `block`-tier finding in the bytes about to be
+  published** — the argv of each claim-bound event and the serialized manifest,
+  claim labels and delta paths included. Override with `--allow-secrets`, which
+  is logged into the manifest; the exported artifact is redacted either way.
+- **What blocks and what is redacted are the same fields.** Every string in a
+  published claim entry that carries operator- or repository-authored text (the
+  argv preview, the label, the pathspecs, the changed paths) is replaced by a
+  marker before the note is written, and the spans are declared in
+  `redaction.applied` / `redaction.fields`. This is stated because it was once
+  false in the worst direction: a token in a claim label refused the seal and
+  was then published verbatim on the override, under a refusal message that had
+  already promised a redacted artifact. Blocking is not redacting.
+- Everything else is **reported loudly and does not stop the seal**: every
+  `notice`-tier finding, and any `block`-tier finding confined to the recorded
+  output blobs, which stay in a gitignored local ledger and are never published.
+  Refusing over bytes that do not leave stopped work without protecting anything.
+- The manifest records **what was scanned** (`secrets`: the domain, the events
+  scanned out of the events present, the bytes, the detector-set version, and
+  the findings per tier), so `secrets_override: false` is a checkable statement
+  instead of the same word for "nothing found" and "almost nothing looked at".
+- Every finding carries a location: source kind, event index, argv index or line,
+  byte offset, and a **locality** fingerprint. The fingerprint deliberately does
+  not digest the matched token — an unkeyed digest of a short high-entropy string
+  would be a brute-force oracle for the thing just redacted.
 - Redaction applies to what *leaves* the machine (bundles, HTML reports). The raw
-  local ledger is left intact and stays local.
+  local ledger is left intact and stays local. One documented exception: an HTML
+  report's file list for a `stale` claim is **recomputed against your working
+  tree** at verify time rather than read from the note, so it is not the note's
+  redacted copy — see docs/COMPAT.md.
 
 The scanner is a safety net tuned to bound false positives, not a guarantee. Do
 not rely on it to catch a novel secret format; keep secrets out of command output.
+How weak the entropy tier is in **both** directions is measured, not asserted —
+see the detection tables in MEASUREMENTS.md. Those tables also bound the other
+direction: the entropy sweep misses roughly 1–3% of slash-bearing base64
+credentials by design, and nothing in it resists an attacker who knows the rule.
 
 ## Honest capture limits
 

@@ -76,15 +76,28 @@ didrun verify --strict        # exit 0 only if every claim is recorded-exact
 ```
 
 The `--strict` exit code is the CI seam: wire `didrun verify --strict` into your
-pipeline and a drifted or unbacked claim fails the build. For humans, generate a
-self-contained HTML evidence report:
+pipeline and a drifted or unbacked claim fails the build.
+
+Every verdict also reports how the environment compared with the one the seal
+recorded — `env: N match / M drifted / K incomparable`. Drift is advisory by
+default, because a changed environment is a fact about the machine verifying,
+not about whether the recorded command ran; `didrun verify --require-env-match
+--strict` makes it a refusal. Evidence sealed by an older didrun is
+*incomparable*, never drifted, and never refuses.
+
+For humans, generate a self-contained HTML evidence report:
 
 ```bash
 didrun verify --html evidence.html
 ```
 
-The report is a single file with zero external assets — it opens offline, prints
-cleanly, and is safe to attach to a PR (secrets are redacted from every export).
+The report is a single file with zero external assets — it opens offline and
+prints cleanly. Redaction covers the sealed note: every exported claim string —
+the `argv_preview`, the label, the pathspecs and the changed paths — is
+redacted, and the projection is declared in the manifest. The HTML report
+carries no argv at all and renders the note's redacted label, but a stale
+claim's file list is recomputed against your working tree at verify time and is
+shown as it is on disk — read it before you attach it to a PR.
 
 ## Use it with your coding agent
 
@@ -134,8 +147,8 @@ correct or that the command meaningfully tested anything.
 
 - `didrun run -- <cmd>` — record a wrapped execution (complete capture).
 - `didrun claim <type> [--path <spec>]` — declare a structured claim.
-- `didrun seal` — compile a commit-bound evidence manifest (redacts secrets; blocks by default if found).
-- `didrun verify [--strict] [--html <file>]` — check claims against recorded evidence.
+- `didrun seal` — compile a commit-bound evidence manifest (redacts secrets; refuses when a structured secret is found in what it is about to publish, warns about the rest).
+- `didrun verify [--strict] [--require-env-match] [--html <file>]` — check claims against recorded evidence.
 - `didrun show [--session]` — show the verdict, or the recorded session history.
 
 ## Capture is tiered and honest about coverage

@@ -20,6 +20,8 @@ import html
 import os
 from typing import Optional
 
+from .claims import ENV_DRIFT, ENV_INCOMPARABLE, ENV_MATCH, ENV_NOT_RECORDED
+
 # Grade -> (text token, ANSI color, severity marker for NO_COLOR, honest gloss).
 # The token NEVER overclaims: the strongest positive says TREE-EXACT ("the
 # evidence tree equals the sealed tree"), never "VERIFIED"/"PROVEN" — didrun
@@ -104,6 +106,33 @@ def _skipped_notes(n: int) -> str:
     return f"{n} note{'' if n == 1 else 's'} skipped (unparseable)"
 
 
+def env_summary_text(report) -> str:
+    """One line for how the sealed environment fingerprints compared.
+
+    The three counters are always printed, zeros included: "0 drifted" is a
+    measurement and a missing counter is not. `not-recorded` is appended only
+    when it is nonzero — it is the shape of every note published before the
+    fingerprint was bound, and printing "0 not-recorded" on every modern verify
+    would be noise about a case that no longer occurs.
+
+    Whether drift REFUSES is said here rather than left implied. The same three
+    numbers mean different things under --require-env-match, and a reader who
+    cannot tell which mode produced them cannot act on either.
+    """
+    counts = report.env_counts
+    line = (
+        f"env: {counts[ENV_MATCH]} match / {counts[ENV_DRIFT]} drifted / "
+        f"{counts[ENV_INCOMPARABLE]} incomparable"
+    )
+    if counts[ENV_NOT_RECORDED]:
+        line += f" / {counts[ENV_NOT_RECORDED]} not-recorded"
+    if report.require_env_match:
+        line += "  (drift refuses: --require-env-match)"
+    elif counts[ENV_DRIFT]:
+        line += "  (advisory; --require-env-match makes it refuse)"
+    return line
+
+
 def chain_banner_text(report) -> str:
     """The chain sentence a reviewer must not miss, or "" when there is none.
 
@@ -169,6 +198,7 @@ def render_verdict(report, width: int = 80) -> str:
     # How many of those verdicts were checked against the recorded entry the
     # seal named, rather than regraded against whatever ledger is on disk now.
     lines.append(f"  {report.evidence_bound_count}/{total} claims evidence-bound")
+    lines.append(f"  {env_summary_text(report)}")
     if report.secrets_override:
         lines.append(_c("  ! sealed with --allow-secrets (redacted export)", "33"))
     if report.notes_skipped:
@@ -185,6 +215,14 @@ def render_verdict(report, width: int = 80) -> str:
         if r.exit_code is not None:
             detail = f"exit {r.exit_code}  {detail}"
         lines.append(f"  {marker} {_c(f'{token:<12}', color)} {label:<26} {detail}")
+        # The drifted rows say so individually. `incomparable` does not get a
+        # row of its own: it is the state of every note published before the
+        # fingerprint was bound, so a per-claim line would be a paragraph of
+        # boilerplate under an archive — the header counter already reports it.
+        if r.env_status == ENV_DRIFT:
+            lines.append(
+                f"    {'':<12} {'':<26}   {ENV_DRIFT}: {_sanitize(r.env_reason)}"
+            )
         # Drill-down: show the delta for stale/scope, capped.
         for change in r.delta[:5]:
             lines.append(f"    {'':<12} {'':<26}   {change.status} {_sanitize(change.path)}")
@@ -230,12 +268,19 @@ def render_html(report, title: str = "didrun evidence report") -> str:
             more = f"<li>… {len(r.delta) - 20} more</li>" if len(r.delta) > 20 else ""
             delta_html = f"<ul class='delta'>{items}{more}</ul>"
         claim_label = r.claim.label if not isinstance(r.claim, dict) else r.claim.get("label", "")
+        # Same rule as the CLI table: drifted rows say so, incomparable ones are
+        # left to the header counter.
+        env_html = (
+            f"<span class='envdrift'>{esc(ENV_DRIFT)}: {esc(r.env_reason)}</span>"
+            if r.env_status == ENV_DRIFT
+            else ""
+        )
         rows.append(
             f"<tr class='{grade_class}'>"
             f"<td class='status'><span class='badge {grade_class}'>{esc(token)}</span></td>"
             f"<td class='claim'>{esc(claim_label)}</td>"
             f"<td class='detail'><span class='reason'>{detail}</span>"
-            f"<span class='exit'>{esc(exit_txt)}</span>{delta_html}</td>"
+            f"<span class='exit'>{esc(exit_txt)}</span>{env_html}{delta_html}</td>"
             f"</tr>"
         )
 
@@ -339,6 +384,9 @@ def render_html(report, title: str = "didrun evidence report") -> str:
   .detail {{ color:var(--dim); }}
   .detail .reason {{ display:block; }}
   .exit {{ display:inline-block; margin-top:2px; color:var(--mono); font-size:12px; }}
+  /* Advisory by default, so it is toned like the warn states rather than the
+     failure ones — drift does not make a recorded command un-run. */
+  .envdrift {{ display:block; margin-top:4px; color:var(--warn); font-size:12px; }}
   .delta {{ margin:6px 0 0; padding-left:16px; color:var(--dim); font-size:12px; }}
   .delta li {{ overflow-wrap:anywhere; }}
   .delta .ch {{ display:inline-block; width:14px; color:var(--mono); font-weight:700; }}
@@ -365,6 +413,7 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     {chain_html}
     <div class="meta">{esc(verified)}/{esc(total)} claims recorded-exact ·
       {esc(report.evidence_bound_count)}/{esc(total)} claims evidence-bound ·
+      {esc(env_summary_text(report))} ·
       commit {esc(report.commit[:12])} · tree {esc(report.tree[:12])} ·
       resolved-by {esc(report.resolved_by)} · coverage {coverage_html}</div>
   </header>

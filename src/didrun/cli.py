@@ -122,9 +122,16 @@ def cmd_seal(args) -> int:
         print(f"didrun seal: {exc}", file=sys.stderr)
         return 2
     verified = sum(1 for c in m.claims if c["grade"] in ("tree-exact", "scope-exact"))
+    # The tier split is reported even when nothing blocked: "0 findings" and
+    # "12 findings, none of them blocking" are different facts about the same
+    # green seal, and only one of them is worth a second look.
+    by_tier = (m.secrets or {}).get("findings_by_tier", {})
+    blocking = by_tier.get("block", 0)
+    noticed = by_tier.get("notice", 0)
     print(
         f"sealed manifest for {m.commit[:12]} (tree {m.tree[:12]})  "
-        f"{verified}/{len(m.claims)} claims recorded-exact"
+        f"{verified}/{len(m.claims)} claims recorded-exact  "
+        f"{blocking + noticed} findings ({blocking} block / {noticed} notice)"
         + ("  [--allow-secrets]" if m.secrets_override else "")
     )
     return 0
@@ -134,7 +141,12 @@ def cmd_verify(args) -> int:
     repo = Path(args.repo or os.getcwd())
     session = _session(repo, readonly=True)
     try:
-        report = _manifest.verify(session, repo, commitish=args.commit or "HEAD")
+        report = _manifest.verify(
+            session,
+            repo,
+            commitish=args.commit or "HEAD",
+            require_env_match=args.require_env_match,
+        )
     except _manifest.ManifestError as exc:
         # Evidence this binary cannot read is a graded refusal, not a crash. 2,
         # not --strict's 1: "could not read the manifest" is a different fact
@@ -198,8 +210,7 @@ def _show_output(session: Session, args) -> int:
         print(f"didrun show: {exc}", file=sys.stderr)
         return 2
     if args.redacted:
-        text, _findings = redact.redact(data)
-        data = text.encode("utf-8", "replace")
+        data = redact.redact(data).text.encode("utf-8", "replace")
     out = getattr(sys.stdout, "buffer", None)
     if out is not None:
         out.write(data)
@@ -302,6 +313,15 @@ def build_parser() -> argparse.ArgumentParser:
     pv = sub.add_parser("verify", help="verify a commit's claims against recorded evidence")
     pv.add_argument("--commit", help="commit to verify (default: HEAD)")
     pv.add_argument("--strict", action="store_true", help="exit nonzero unless all claims are recorded-exact (CI mode)")
+    pv.add_argument(
+        "--require-env-match",
+        action="store_true",
+        help=(
+            "treat environment drift since the seal as a refusal, not a note "
+            "(with --strict, a drifted claim exits nonzero). Fingerprints from "
+            "an older didrun are incomparable and never count as drift"
+        ),
+    )
     pv.add_argument("--html", help="also write an HTML report to this path")
     pv.add_argument("--quiet", action="store_true", help="with --html, suppress the terminal verdict")
     pv.set_defaults(func=cmd_verify)
