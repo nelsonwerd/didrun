@@ -43,7 +43,8 @@ def test_redact_replaces_with_marker():
 
 # --- render helpers ----------------------------------------------------------
 
-def _report(results, all_verified=False, worst="stale"):
+def _report(results, all_verified=False, worst="stale", chain="intact",
+            chain_index=None, chain_why=""):
     @dataclass
     class R:
         commit: str = "abcdef123456"
@@ -53,6 +54,13 @@ def _report(results, all_verified=False, worst="stale"):
         coverage: dict = None
         secrets_override: bool = False
         notes_skipped: int = 0
+        # Mirrors VerifyReport's chain fields. Carried as real attributes rather
+        # than left off: render reads them directly, so a surface that starts
+        # depending on a chain state this fake cannot express fails here loudly
+        # instead of silently rendering the default.
+        chain_status: str = chain
+        chain_broken_index: object = chain_index
+        chain_reason: str = chain_why
 
         @property
         def worst_status(self):
@@ -61,6 +69,16 @@ def _report(results, all_verified=False, worst="stale"):
         @property
         def all_verified(self):
             return all_verified
+
+        # Mirrors VerifyReport: both human surfaces report how many verdicts
+        # were checked against the recorded entry the seal named.
+        @property
+        def evidence_bound_count(self):
+            return sum(1 for r in self.results if r.evidence_bound)
+
+        @property
+        def total(self):
+            return len(self.results)
 
     return R(results=results, coverage={"by_coverage": {"complete": 1}})
 

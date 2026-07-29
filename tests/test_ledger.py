@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -40,6 +41,42 @@ def test_blob_roundtrip_and_dedup(tmp_path: Path):
     d2 = store.put(b"hello")
     assert d1 == d2 == sha256_hex(b"hello")  # identical content -> one digest
     assert store.get(d1) == b"hello"
+
+
+def test_two_writers_of_one_blob_do_not_collide_on_a_temp_name(
+    tmp_path: Path, monkeypatch
+):
+    """P2.4 — concurrent recorders store the same blob constantly.
+
+    An empty stderr is one digest every event shares, so two `didrun run`
+    processes writing at once is the normal case, not the exotic one. This is
+    the crash, driven deterministically instead of hoped for: writer A is
+    suspended at its rename, writer B completes the SAME blob inside that
+    window, and A resumes. With a shared ``<digest>.tmp`` name B's rename has
+    already consumed A's temp and A dies with FileNotFoundError.
+
+    Measured before the fix on an eight-way concurrent `didrun run`: 2 of 6
+    attempts lost a process to exactly this traceback.
+    """
+    root = tmp_path / "obj"
+    store = BlobStore(root)
+    data = b"identical bytes from both writers"
+    real_replace = os.replace
+    interleaved = []
+
+    def replace_with_a_second_writer_inside(src, dst):
+        if not interleaved:
+            interleaved.append(True)
+            BlobStore(root).put(data)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace_with_a_second_writer_inside)
+
+    assert store.put(data) == sha256_hex(data)
+    assert interleaved == [True], "the second writer never ran; the test is vacuous"
+    assert store.get(sha256_hex(data)) == data
+    # No temp residue survives a completed pair of writes.
+    assert [p.name for p in root.iterdir()] == [sha256_hex(data)]
 
 
 def test_blob_corruption_detected(tmp_path: Path):

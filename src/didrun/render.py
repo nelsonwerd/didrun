@@ -24,16 +24,45 @@ from typing import Optional
 # The token NEVER overclaims: the strongest positive says TREE-EXACT ("the
 # evidence tree equals the sealed tree"), never "VERIFIED"/"PROVEN" — didrun
 # records, it does not prove. The marker carries severity when color is absent.
+#
+# EVERY grade must be registered in BOTH tables. Both are read through
+# `.get(…, UNKNOWN)`, so an unregistered grade does not raise — it renders as
+# UNKNOWN, which is a silent lie about what the verdict actually said.
+#
+# `chain-broken` is the one row here that is not a claim grade: no GradeResult
+# ever carries it, so no table row ever displays it. It is a whole-report
+# verdict — `VerifyReport.worst_status` returns it when the live ledger's chain
+# does not recompute — and `render_verdict` looks the VERDICT up in this same
+# table, so without a row the worst thing didrun can say about a ledger would
+# print as UNKNOWN.
 _GRADE_DISPLAY = {
+    "chain-broken": ("CHAIN-BROKEN", "31", "x", "the ledger chain does not recompute"),
     "failed": ("FAILED", "31", "x", "recorded command exited non-zero"),
     "unknown": ("UNKNOWN", "33", "?", "no honest binding"),
+    "witness-unavailable": (
+        "WITNESS-UNAVAIL",
+        "33",
+        "?",
+        "sealed grade shown; live evidence not found",
+    ),
     "stale": ("STALE", "33", "!", "tree moved since evidence"),
     "scope-exact": ("SCOPE-EXACT", "36", "~", "change within declared scope"),
     "tree-exact": ("TREE-EXACT", "32", "=", "recorded against the sealed tree"),
 }
 
 # Sort order: worst first. A reviewer sees problems before recorded-exact rows.
-_SORT_RANK = {"failed": 0, "unknown": 1, "stale": 2, "scope-exact": 3, "tree-exact": 4}
+# `chain-broken` sorts above `failed` for completeness only — it is a report-level
+# verdict, never a per-claim grade, so nothing is ever sorted by this rank. Do not
+# go looking for the rows; there are none.
+_SORT_RANK = {
+    "chain-broken": -1,
+    "failed": 0,
+    "unknown": 1,
+    "witness-unavailable": 2,
+    "stale": 3,
+    "scope-exact": 4,
+    "tree-exact": 5,
+}
 
 
 def _use_color() -> bool:
@@ -75,14 +104,48 @@ def _skipped_notes(n: int) -> str:
     return f"{n} note{'' if n == 1 else 's'} skipped (unparseable)"
 
 
+def chain_banner_text(report) -> str:
+    """The chain sentence a reviewer must not miss, or "" when there is none.
+
+    Printed for `broken` and `unverifiable` only. `absent` and `empty` are NOT
+    chain faults — a ledger that is elsewhere, or has recorded nothing yet, is a
+    witness-availability fact that the per-claim rows already state as
+    `witness-unavailable`. Rendering a missing ledger as tamper would make every
+    verify against an archived ledger read like an attack.
+
+    `broken` and `unverifiable` get different words on purpose: broken means an
+    entry did not recompute to its stored hash, unverifiable means this binary
+    could not recompute it at all. Only the first is evidence of mutation.
+    """
+    status = report.chain_status
+    if status == "broken":
+        where = "" if report.chain_broken_index is None else f" at index {report.chain_broken_index}"
+        return f"ledger chain BROKEN{where} — every grade below is unreliable"
+    if status == "unverifiable":
+        reason = _sanitize(report.chain_reason) or "this binary cannot recompute it"
+        return f"ledger chain unverifiable — {reason}; every grade below is unreliable"
+    return ""
+
+
+def render_chain_banner(report) -> str:
+    """The terminal form of the chain sentence: marker, colour, "" when clean."""
+    text = chain_banner_text(report)
+    return _c(f"x {text}", "31") if text else ""
+
+
 def render_verdict(report, width: int = 80) -> str:
     """Render a VerifyReport as the CLI instrument panel."""
     lines: list[str] = []
     results = sorted(report.results, key=lambda r: _SORT_RANK.get(r.grade, 9))
+    banner = render_chain_banner(report)
 
     worst = report.worst_status if report.results else "empty"
     if worst == "empty":
         lines.append(_c("○ NO CLAIMS", "33") + "  nothing sealed for this commit")
+        # A broken chain is worth saying even with nothing sealed here: the
+        # ledger is still the thing every other command reads.
+        if banner:
+            lines.append(banner)
         lines.append(f"  commit {report.commit[:12] or '(none)'} · resolved-by {report.resolved_by}")
         if report.notes_skipped:
             lines.append(_c(f"  ! {_skipped_notes(report.notes_skipped)}", "33"))
@@ -96,11 +159,16 @@ def render_verdict(report, width: int = 80) -> str:
     # carries severity even with color stripped.
     headline = "ALL RECORDED-EXACT" if report.all_verified else f"{token} — review needed"
     lines.append(_c(f"{marker} {headline}", color))
+    if banner:
+        lines.append(banner)
     lines.append(
         f"  {verified}/{total} claims recorded-exact · "
         f"commit {report.commit[:12]} · tree {report.tree[:12]} · "
         f"resolved-by {report.resolved_by}"
     )
+    # How many of those verdicts were checked against the recorded entry the
+    # seal named, rather than regraded against whatever ledger is on disk now.
+    lines.append(f"  {report.evidence_bound_count}/{total} claims evidence-bound")
     if report.secrets_override:
         lines.append(_c("  ! sealed with --allow-secrets (redacted export)", "33"))
     if report.notes_skipped:
@@ -171,8 +239,21 @@ def render_html(report, title: str = "didrun evidence report") -> str:
             f"</tr>"
         )
 
+    # The chain sentence gets its own block above the table, not a table row:
+    # it is a statement about the ledger every row was read out of, so a row
+    # would file it alongside the very grades it invalidates.
+    chain_text = chain_banner_text(report)
+    chain_html = (
+        f'<div class="chainbanner">{esc(chain_text)}</div>' if chain_text else ""
+    )
+
     if all_ok:
         verdict_class, verdict_text = "ok", "ALL RECORDED-EXACT"
+    elif worst == "chain-broken":
+        verdict_class = "failed"
+        verdict_text = (
+            f"{esc(_GRADE_DISPLAY['chain-broken'][0])} — the ledger chain does not recompute"
+        )
     elif worst == "failed":
         verdict_class = "failed"
         verdict_text = f"{esc(_GRADE_DISPLAY['failed'][0])} — a claimed command was recorded failing"
@@ -225,6 +306,10 @@ def render_html(report, title: str = "didrun evidence report") -> str:
   .verdict.ok {{ color:var(--ok); }}
   .verdict.attention {{ color:var(--warn); }}
   .verdict.failed {{ color:var(--bad); }}
+  /* Filled, not tinted: a chain fault invalidates every row under it, so it is
+     the one block that must survive a fast scan and a monochrome printout. */
+  .chainbanner {{ margin:8px 0; padding:8px 10px; border-radius:3px;
+    background:var(--bad-fill); color:var(--on-fill); font-weight:700; }}
   .meta {{ color:var(--dim); font-size:12px; word-break:break-all; }}
   table {{ width:100%; border-collapse:collapse; margin-top:8px; table-layout:fixed; }}
   th {{ text-align:left; color:var(--dim); font-weight:500; font-size:11px;
@@ -239,16 +324,18 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     font-weight:700; letter-spacing:.03em; border:1px solid currentColor; white-space:nowrap; }}
   .badge.tree_exact {{ color:var(--ok); }}
   .badge.scope_exact {{ color:var(--scope); }}
-  .badge.stale, .badge.unknown {{ color:var(--warn); }}
+  .badge.stale, .badge.unknown, .badge.witness_unavailable {{ color:var(--warn); }}
   /* Failure and stale are the MOST-designed states: solid-filled badges + a
      left accent bar so a problem row is unmistakable on a fast scan. */
   .badge.failed {{ color:var(--on-fill); background:var(--bad-fill); border-color:var(--bad-fill); }}
   .badge.stale {{ color:var(--on-fill); background:var(--warn-fill); border-color:var(--warn-fill); }}
-  tr.stale td, tr.unknown td {{ background:color-mix(in srgb, var(--warn) 10%, transparent); }}
+  tr.stale td, tr.unknown td, tr.witness_unavailable td {{
+    background:color-mix(in srgb, var(--warn) 10%, transparent); }}
   tr.failed td {{ background:color-mix(in srgb, var(--bad) 12%, transparent); }}
   tr.failed td.status {{ box-shadow:inset 3px 0 0 var(--bad); }}
   tr.stale td.status {{ box-shadow:inset 3px 0 0 var(--warn); }}
   tr.unknown td.status {{ box-shadow:inset 3px 0 0 var(--warn); }}
+  tr.witness_unavailable td.status {{ box-shadow:inset 3px 0 0 var(--warn); }}
   .detail {{ color:var(--dim); }}
   .detail .reason {{ display:block; }}
   .exit {{ display:inline-block; margin-top:2px; color:var(--mono); font-size:12px; }}
@@ -263,7 +350,11 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     .badge {{ padding:2px 5px; font-size:10px; }}
   }}
   @media print {{ body {{ background:#fff; color:#000; }} .wrap {{ max-width:none; }}
-    tr.failed td, tr.stale td, tr.unknown td {{ background:transparent; }} }}
+    tr.failed td, tr.stale td, tr.unknown td, tr.witness_unavailable td {{
+      background:transparent; }}
+    /* Browsers drop backgrounds when printing, which would leave the chain
+       sentence white-on-white — the one line that must never disappear. */
+    .chainbanner {{ background:transparent; color:#000; border:2px solid #000; }} }}
 </style>
 </head>
 <body>
@@ -271,7 +362,9 @@ def render_html(report, title: str = "didrun evidence report") -> str:
   <header>
     <div class="brand">didrun · flight record</div>
     <div class="verdict {verdict_class}">{verdict_text}</div>
+    {chain_html}
     <div class="meta">{esc(verified)}/{esc(total)} claims recorded-exact ·
+      {esc(report.evidence_bound_count)}/{esc(total)} claims evidence-bound ·
       commit {esc(report.commit[:12])} · tree {esc(report.tree[:12])} ·
       resolved-by {esc(report.resolved_by)} · coverage {coverage_html}</div>
   </header>

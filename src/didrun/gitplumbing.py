@@ -228,12 +228,19 @@ class PathChange:
 
 def tree_delta(
     repo: Path, tree_a: str, tree_b: str, ledger_objects: Optional[Path] = None
-) -> list[PathChange]:
+) -> Optional[list[PathChange]]:
     """Exact path-level delta between two tree objects.
 
     Requires that both trees' objects are reachable — the ledger's redirected
     objects plus the repo's own. This is what turns "stale" from a shrug into a
     measured statement ("stale: 1 line changed in src/foo.py").
+
+    Two return values that must never be conflated: ``[]`` means *computed, and
+    the trees are equal*; ``None`` means *not computable* — git failed, so
+    nothing at all is known about the difference. Returning ``[]`` on failure
+    (v0.1 did) lets the caller render "0 path(s) differ" and "evidence tree
+    equals sealed tree" as facts derived from a subprocess that failed, which
+    is exactly the archived-ledger case where the evidence objects are gone.
     """
     env = {}
     if ledger_objects is not None:
@@ -246,7 +253,7 @@ def tree_delta(
         check=False,
     )
     if proc.returncode != 0:
-        return []
+        return None
     changes: list[PathChange] = []
     for line in proc.stdout.splitlines():
         parts = line.split("\t")

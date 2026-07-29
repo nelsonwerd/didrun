@@ -297,7 +297,12 @@ def test_leg1_chain_recompute(replay_source):
 # lack, because `from_json` reads them with a v1-reproducing default. Hard
 # coded per manifest version so a new manifest field is a deliberate one-line
 # diff here and never a silent pass.
-MANIFEST_ADDITIVE_KEYS = {1: frozenset({"secrets_override"})}
+# v2 introduced no top-level manifest key — the evidence binding lives inside
+# each claim entry — so its allowlist is v1's.
+MANIFEST_ADDITIVE_KEYS = {
+    1: frozenset({"secrets_override"}),
+    2: frozenset({"secrets_override"}),
+}
 
 
 def note_violations(raw: bytes, ordinal: int, additive_keys=None) -> list:

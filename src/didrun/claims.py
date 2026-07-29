@@ -46,6 +46,13 @@ GRADE_UNKNOWN = "unknown"
 # The strongest negative signal: didrun WITNESSED the claimed command fail. This
 # is distinct from `unknown` (no evidence at all) — it is a claim caught lying.
 GRADE_FAILED = "failed"
+# The note records a grade for this claim, but the live ledger cannot supply the
+# evidence it was sealed against — this is not a verification. It is never
+# produced by ``grade()``: the ladder below grades a claim against evidence it
+# can see, and this state says the evidence itself is gone, or is not the
+# evidence that was sealed. manifest.verify assigns it AROUND the ladder, and it
+# is never admitted to the set --strict accepts.
+GRADE_WITNESS_UNAVAILABLE = "witness-unavailable"
 
 
 class ClaimError(Exception):
@@ -95,7 +102,13 @@ class Claim:
 
 @dataclass
 class GradeResult:
-    """The outcome of grading one claim against a target tree."""
+    """The outcome of grading one claim against a target tree.
+
+    ``evidence_bound`` and ``sealed_grade`` are verify-side facts, not grading
+    facts: they say whether this verdict was checked against the specific
+    recorded entry the seal named, and what that seal graded. ``grade()`` never
+    sets them, so a sealed note carries them at their defaults.
+    """
 
     claim: Claim
     grade: str
@@ -103,6 +116,8 @@ class GradeResult:
     delta: list = field(default_factory=list)  # PathChange list when stale/scope
     supporting_event_index: Optional[int] = None
     exit_code: Optional[int] = None
+    evidence_bound: bool = False
+    sealed_grade: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -112,6 +127,8 @@ class GradeResult:
             "delta": [{"status": c.status, "path": c.path} for c in self.delta],
             "supporting_event_index": self.supporting_event_index,
             "exit_code": self.exit_code,
+            "evidence_bound": self.evidence_bound,
+            "sealed_grade": self.sealed_grade,
         }
 
 
@@ -157,20 +174,25 @@ def grade(
     The ordering is the honesty ladder: only concede a weaker grade when the
     stronger one cannot be honestly asserted.
     """
+    # A witnessed failure among the bound events DOMINATES a witnessed success.
+    # Consulting _supporting_event first graded a claim bound to
+    # [failed, success] on the success and made the caught lie invisible.
+    # Reachable only through the library API today (the CLI's --event is
+    # type=int, so every CLI claim binds exactly one event).
+    failure = _witnessed_failure(claim, events)
+    if failure is not None:
+        fidx, fev = failure
+        return GradeResult(
+            claim,
+            GRADE_FAILED,
+            reason=f"the recorded command exited {fev.exit_code} — claim is not backed",
+            supporting_event_index=fidx,
+            exit_code=fev.exit_code,
+        )
+
     found = _supporting_event(claim, events)
     if found is None:
-        # No witnessed success. Is that because we watched it FAIL (a caught
-        # lie) or because there is no evidence at all (unknown)?
-        failure = _witnessed_failure(claim, events)
-        if failure is not None:
-            fidx, fev = failure
-            return GradeResult(
-                claim,
-                GRADE_FAILED,
-                reason=f"the recorded command exited {fev.exit_code} — claim is not backed",
-                supporting_event_index=fidx,
-                exit_code=fev.exit_code,
-            )
+        # No witnessed success and no witnessed failure: no evidence at all.
         return GradeResult(
             claim,
             GRADE_UNKNOWN,
@@ -223,6 +245,19 @@ def grade(
 
     # Compute the delta between the evidence tree and the sealed tree.
     delta = gitplumbing.tree_delta(repo, ev.tree_after, sealed_tree, ledger_objects)
+    if delta is None:
+        # Fail closed. `None` is "git could not compute it" — typically the
+        # archived-ledger case where the evidence tree's objects have moved.
+        # Every branch below would otherwise render that failure as a fact
+        # ("0 path(s) differ", "evidence tree equals sealed tree"), and an
+        # empty delta would also violate the stale-carries-the-delta invariant.
+        return GradeResult(
+            claim,
+            GRADE_UNKNOWN,
+            reason="delta not computable: evidence tree objects unavailable",
+            supporting_event_index=idx,
+            exit_code=ev.exit_code,
+        )
 
     # scope-exact: every change is within the claimant-declared pathspecs.
     if claim.pathspecs:

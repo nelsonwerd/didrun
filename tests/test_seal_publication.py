@@ -27,7 +27,9 @@ _REAL_RUN = subprocess.run
 
 # Keys `to_json()` emits that a note of this manifest version never carried.
 # Additive fields land here as a DELIBERATE one-line diff, never silently.
-_ADDITIVE_KEYS_BY_MANIFEST_VERSION = {1: frozenset()}
+# v2 adds no TOP-LEVEL key: the evidence binding lives inside each claim entry,
+# so the manifest's own key set is unchanged from v1.
+_ADDITIVE_KEYS_BY_MANIFEST_VERSION = {1: frozenset(), 2: frozenset()}
 
 
 def _session(repo: Path) -> Session:

@@ -16,10 +16,16 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
-from .ledger import Session
-from .capture import run_wrapped, DIDRUN_ACTIVE_ENV
+from .ledger import LedgerError, Session
+from .capture import (
+    CaptureInterrupted,
+    DIDRUN_ACTIVE_ENV,
+    run_wrapped,
+    signal_name,
+)
 from .claims import Claim
 from . import manifest as _manifest
+from . import redact
 from . import render
 from . import gitplumbing
 
@@ -28,8 +34,15 @@ def _ledger_dir(repo: Path) -> Path:
     return Path(repo) / ".didrun"
 
 
-def _session(repo: Path) -> Session:
-    return Session(_ledger_dir(repo))
+def _session(repo: Path, readonly: bool = False) -> Session:
+    """Open the repo's ledger.
+
+    ``readonly=True`` is for the commands that only read one: it creates no
+    directory, writes no .gitignore, and re-modes nothing. Without it `verify`
+    on a fresh clone MANUFACTURED an empty ledger — which then graded every
+    claim unknown — and pointing `show` at someone else's archive mutated it.
+    """
+    return Session(_ledger_dir(repo), readonly=readonly)
 
 
 def cmd_run(args) -> int:
@@ -46,7 +59,9 @@ def cmd_run(args) -> int:
     session = _session(repo)
     # Mark the session active so Tier-1/2 hooks (if installed) are live only now.
     os.environ.setdefault(DIDRUN_ACTIVE_ENV, "1")
-    event = run_wrapped(list(args.command), session, repo)
+    event = run_wrapped(
+        list(args.command), session, repo, tee=args.tee, heartbeat=args.heartbeat
+    )
     coverage = "shim" if args.shim else "wrapper"
     print(
         f"recorded {coverage} event  argv={' '.join(event.argv)!r}  "
@@ -117,7 +132,7 @@ def cmd_seal(args) -> int:
 
 def cmd_verify(args) -> int:
     repo = Path(args.repo or os.getcwd())
-    session = _session(repo)
+    session = _session(repo, readonly=True)
     try:
         report = _manifest.verify(session, repo, commitish=args.commit or "HEAD")
     except _manifest.ManifestError as exc:
@@ -131,6 +146,14 @@ def cmd_verify(args) -> int:
         print(f"wrote HTML report to {args.html}")
         if not args.quiet:
             print(render.render_verdict(report))
+        else:
+            # --quiet suppresses the VERDICT, not the ledger's integrity. A
+            # broken chain says the file that verdict was computed from does not
+            # recompute; a reader who sent the detail to HTML still needs that
+            # sentence where they are looking.
+            banner = render.render_chain_banner(report)
+            if banner:
+                print(banner)
     else:
         print(render.render_verdict(report))
     if args.strict:
@@ -138,9 +161,59 @@ def cmd_verify(args) -> int:
     return 0
 
 
+def _show_output(session: Session, args) -> int:
+    """Print one recorded output blob to stdout.
+
+    The only path in the CLI that reads a blob back. Without it, reading the
+    output of a recorded failure meant resolving digests by hand under
+    `.didrun/objects`. `BlobStore.get` re-hashes on read, so a corrupted or
+    edited blob is a refusal here rather than bytes presented as the record.
+    """
+    if args.event is None:
+        print(
+            "didrun show: --output needs --event N (which recorded event to read)",
+            file=sys.stderr,
+        )
+        return 2
+    events = session.events()
+    if not 0 <= args.event < len(events):
+        print(
+            f"didrun show: no event at index {args.event} "
+            f"(the session has {len(events)} events)",
+            file=sys.stderr,
+        )
+        return 2
+    ev = events[args.event]
+    digest = ev.stdout_blob if args.stream == "stdout" else ev.stderr_blob
+    if digest is None:
+        print(
+            f"didrun show: event {args.event} recorded no {args.stream} blob",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        data = session.blobs.get(digest)
+    except LedgerError as exc:
+        # Missing or corrupt evidence is a graded refusal, never a traceback.
+        print(f"didrun show: {exc}", file=sys.stderr)
+        return 2
+    if args.redacted:
+        text, _findings = redact.redact(data)
+        data = text.encode("utf-8", "replace")
+    out = getattr(sys.stdout, "buffer", None)
+    if out is not None:
+        out.write(data)
+        out.flush()
+    else:
+        sys.stdout.write(data.decode("utf-8", "replace"))
+    return 0
+
+
 def cmd_show(args) -> int:
     repo = Path(args.repo or os.getcwd())
-    session = _session(repo)
+    session = _session(repo, readonly=True)
+    if args.output:
+        return _show_output(session, args)
     if args.session:
         # Session history view (subsumes the old `log` command).
         entries = list(session.entries())
@@ -150,6 +223,16 @@ def cmd_show(args) -> int:
         ok, broke = session.verify_chain()
         chain = "intact" if ok else f"BROKEN at index {broke}"
         print(f"session: {len(entries)} events  chain {chain}")
+        if session.tail_truncated:
+            # A lost event is not tamper, and the chain line above is about the
+            # surviving prefix only. Saying so is the difference between a
+            # reader who knows an event is missing and one who does not.
+            print(
+                f"  note: the log's final record is torn at byte "
+                f"{session.tail_truncated_offset} — one event was lost to an "
+                f"interrupted write, and `didrun run` will refuse to append "
+                f"until that is resolved"
+            )
         for e in entries:
             ev = e.event
             exit_txt = f"exit {ev.exit_code}" if ev.exit_code is not None else "no-exit"
@@ -183,6 +266,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     pr = sub.add_parser("run", help="record a wrapped command execution (Tier 0)")
     pr.add_argument("--shim", action="store_true", help=argparse.SUPPRESS)
+    pr.add_argument(
+        "--tee",
+        action="store_true",
+        help=(
+            "also write the command's raw output to this terminal as it arrives "
+            "(local output only: NOT redacted, never an export)"
+        ),
+    )
+    pr.add_argument(
+        "--heartbeat",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "print a progress line to stderr at most every SECONDS "
+            "(elapsed, command, bytes drained; no output content)"
+        ),
+    )
     pr.add_argument("command", nargs=argparse.REMAINDER, help="-- <cmd> [args…]")
     pr.set_defaults(func=cmd_run)
 
@@ -210,6 +310,23 @@ def build_parser() -> argparse.ArgumentParser:
     pw.add_argument("--commit", help="commit to show (default: HEAD)")
     pw.add_argument("--session", action="store_true", help="show the recorded session history (subsumes `log`)")
     pw.add_argument("--html", help="write an HTML report to this path")
+    pw.add_argument("--event", type=int, metavar="N", help="event index to read with --output")
+    pw.add_argument(
+        "--output",
+        action="store_true",
+        help="print the recorded output of event N to stdout",
+    )
+    pw.add_argument(
+        "--stream",
+        choices=["stdout", "stderr"],
+        default="stdout",
+        help="which recorded stream --output reads (default: stdout)",
+    )
+    pw.add_argument(
+        "--redacted",
+        action="store_true",
+        help="run --output through the redactor before printing",
+    )
     pw.set_defaults(func=cmd_show)
 
     return p
@@ -218,7 +335,25 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except CaptureInterrupted as exc:
+        # The event IS on the record — that is what the exception means. One
+        # machine-greppable line and the conventional exit code (130 for SIGINT,
+        # 143 for SIGTERM), so a caller that used to detect interruption by
+        # scraping a traceback gets a better signal than the one it lost.
+        print(
+            f"didrun: interrupted by {signal_name(exc.signum)} — recorded event "
+            f"{exc.event_index} as unobserved (no exit code was witnessed)",
+            file=sys.stderr,
+        )
+        return exc.exit_code
+    except KeyboardInterrupt:
+        # Backstop for an interrupt outside a wrapped child's lifetime — during
+        # a seal, say, where there is no in-flight command to record. A
+        # traceback is still the wrong way to report Ctrl-C.
+        print("didrun: interrupted (SIGINT)", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

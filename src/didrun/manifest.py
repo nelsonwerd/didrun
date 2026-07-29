@@ -21,11 +21,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .ledger import Session, canonical_json
-from .claims import Claim, GradeResult, grade
+from .ledger import Session, canonical_json, _append_lock, _open_private_append
+from .claims import GRADE_WITNESS_UNAVAILABLE, Claim, GradeResult, grade
 from . import gitplumbing, redact
 
-MANIFEST_VERSION = 1
+# 2: a claim may carry an `evidence` block naming the recorded entry that backed
+# it, and verify CHECKS that binding instead of regrading by index alone. The
+# bump is for the change of meaning, not for the new key: an older reader parses
+# a v2 note fine (every key is additive) and regrades it index-only, exactly as
+# it does today. See docs/COMPAT.md.
+MANIFEST_VERSION = 2
 NOTES_REF = "refs/notes/didrun"
 
 
@@ -135,7 +140,11 @@ def seal(
     if tree is None:
         raise ManifestError(f"cannot resolve tree for commit {commit}")
 
-    events = session.events()
+    # Entries, not just events: the seal records WHICH recorded entry backed
+    # each claim, and an entry's chain hash is the only handle on that which
+    # survives the ledger being archived, rebuilt, or replaced.
+    entries = list(session.entries())
+    events = [e.event for e in entries]
     ledger_objects = session.blobs.root
 
     # Seal scoping: a manifest carries the claims declared SINCE THE LAST SEAL —
@@ -164,7 +173,7 @@ def seal(
         version=MANIFEST_VERSION,
         commit=commit,
         tree=tree,
-        claims=[_redact_result(r, session) for r in results],
+        claims=[_redact_result(r, session, entries) for r in results],
         coverage=_coverage_statement(session),
         secrets_override=bool(findings) and allow_secrets,
     )
@@ -196,6 +205,17 @@ def seal(
     return manifest
 
 
+# A chain fault is not a grade any claim can carry; it is a statement about the
+# ledger every grade was read out of. It dominates the verdict for that reason.
+CHAIN_BROKEN = "chain-broken"
+
+# The two chain states that are faults. `empty` and `absent` are not: a missing
+# or empty ledger is a witness-availability fact, already reported per claim as
+# `witness-unavailable`, and calling it tamper would make every verify against
+# an archived ledger look like an attack.
+_CHAIN_FAULTS = ("broken", "unverifiable")
+
+
 @dataclass
 class VerifyReport:
     commit: str
@@ -205,11 +225,34 @@ class VerifyReport:
     coverage: dict
     secrets_override: bool = False
     notes_skipped: int = 0  # notes the tree fallback could not parse at all
+    # The live ledger's chain state. Defaults to "absent" rather than "intact":
+    # a report built without consulting a ledger has not checked the chain, and
+    # saying "intact" there would be the same silent lie an unregistered grade
+    # is in render.py.
+    chain_status: str = "absent"  # intact | broken | unverifiable | empty | absent
+    chain_broken_index: Optional[int] = None  # set only when status is "broken"
+    chain_reason: str = ""
+
+    @property
+    def chain_faulted(self) -> bool:
+        return self.chain_status in _CHAIN_FAULTS
 
     @property
     def worst_status(self) -> str:
         """Worst grade present — drives the verdict and the CI exit code."""
-        order = ["failed", "unknown", "stale", "scope-exact", "tree-exact"]
+        # A broken chain dominates every grade, including "empty": the grades
+        # below it were read out of a ledger that does not recompute, so none of
+        # them is a statement anyone should act on.
+        if self.chain_faulted:
+            return CHAIN_BROKEN
+        order = [
+            "failed",
+            "unknown",
+            GRADE_WITNESS_UNAVAILABLE,
+            "stale",
+            "scope-exact",
+            "tree-exact",
+        ]
         present = {r.grade for r in self.results}
         if not present:
             return "empty"
@@ -220,9 +263,28 @@ class VerifyReport:
 
     @property
     def all_verified(self) -> bool:
+        # Membership is deliberately NOT widened. `witness-unavailable` reports
+        # a grade this run did not check, so admitting it here would make
+        # --strict pass on evidence nobody has seen.
+        if self.chain_faulted:
+            return False
         return bool(self.results) and all(
             r.grade in ("tree-exact", "scope-exact") for r in self.results
         )
+
+    @property
+    def evidence_bound_count(self) -> int:
+        """Claims whose verdict was checked against the entry the seal named.
+
+        The complement is not a failure: a v1 note carries no binding to check,
+        so its claims are regraded by index exactly as they always were. The
+        counter exists so a reader can tell the two apart at a glance.
+        """
+        return sum(1 for r in self.results if r.evidence_bound)
+
+    @property
+    def total(self) -> int:
+        return len(self.results)
 
 
 def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyReport:
@@ -230,10 +292,26 @@ def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyRepor
 
     Resolves by commit id, then by tree id (survives amend/rebase). Degrades a
     claim to unknown ("referenced object gc'd") rather than erroring.
+
+    A claim the note bound to a specific recorded entry is only regraded when
+    the live ledger still holds that entry; otherwise the sealed grade is
+    reported as ``witness-unavailable`` and --strict refuses it. This detects
+    ACCIDENT AND DRIFT on a published note — an archived, rebuilt or replaced
+    ledger. It is not a forger barrier: whoever can substitute a ledger can
+    regenerate its chain and re-run claim+seal to mint fresh hash-bound claims
+    (ledger.py's declared non-guarantee, and docs/TRUST_MODEL.md).
+
+    The chain is checked BEFORE any grading and a fault dominates the verdict:
+    a ledger whose links do not recompute cannot support a statement about
+    anything it holds. Until now ``verify_chain`` had exactly one caller and it
+    was ``show --session``, so a forked or mid-file-rewritten ledger certified
+    green under --strict. ``seal`` still does not consult the chain; that is a
+    separate policy decision, deliberately out of scope here.
     """
     repo = Path(repo)
     commit = _rev(repo, commitish)
     tree = gitplumbing.commit_tree(repo, commitish) if commit else None
+    chain_status, chain_index, chain_reason = _chain_state(session)
 
     manifest, resolved_by, notes_skipped = _resolve_manifest(repo, commit, tree)
     if manifest is None:
@@ -244,23 +322,24 @@ def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyRepor
             results=[],
             coverage={},
             notes_skipped=notes_skipped,
+            chain_status=chain_status,
+            chain_broken_index=chain_index,
+            chain_reason=chain_reason,
         )
 
     # Re-grade the MANIFEST'S OWN claims against its sealed tree (deterministic
     # replay). The manifest is the only thing verify reads besides the repo —
     # the source-of-truth rule. Reading the live session claims file
     # here would let later, unsealed claims leak into an old commit's verdict.
-    events = session.events()
+    entries = list(session.entries())
+    events = [e.event for e in entries]
     ledger_objects = session.blobs.root
     results: list[GradeResult] = []
     for c in manifest.claims:
         claim = Claim.from_dict(c["claim"])
-        try:
-            results.append(grade(claim, manifest.tree, events, repo, ledger_objects))
-        except Exception as exc:  # object gc'd or unreadable → unknown, not crash
-            results.append(
-                GradeResult(claim, "unknown", reason=f"regrade failed: {exc}")
-            )
+        results.append(
+            _verify_claim(c, claim, manifest, entries, events, repo, ledger_objects)
+        )
     return VerifyReport(
         commit=manifest.commit,
         tree=manifest.tree,
@@ -269,7 +348,144 @@ def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyRepor
         coverage=manifest.coverage,
         secrets_override=manifest.secrets_override,
         notes_skipped=notes_skipped,
+        chain_status=chain_status,
+        chain_broken_index=chain_index,
+        chain_reason=chain_reason,
     )
+
+
+def _chain_state(session: Session) -> tuple[str, Optional[int], str]:
+    """The live ledger's chain state, as (status, broken_index, reason).
+
+    ``verify_chain_detail`` reports a log with no records as ``empty`` whether
+    the file is missing or present-and-zero-length. Those are different facts
+    here: a missing log is an ARCHIVED (or never-created) ledger, which P1.2
+    already reports honestly per claim as ``witness-unavailable``, and reporting
+    it as a chain state at all would put a ledger-integrity sentence in front of
+    a reader whose ledger is simply somewhere else.
+
+    ``broken_index`` is populated only for ``broken``. An unverifiable entry has
+    no broken index — nothing was shown not to recompute; this binary could not
+    recompute it — so its index travels in the reason instead, which is where
+    ``verify_chain_detail`` already put it.
+
+    A log this binary cannot even READ — a torn line, a record whose event body
+    carries keys the schema rejects — is ``unverifiable`` rather than a
+    traceback. Two reasons: the package's stated posture is that evidence it
+    cannot read is a graded refusal, not a crash (``cmd_verify``'s exit 2,
+    ``_regrade``'s fallback); and this runs BEFORE the manifest is resolved, so
+    without it a torn ledger would start crashing ``verify`` on commits with no
+    sealed note at all — a path that never read the ledger before.
+    """
+    try:
+        verdict = session.verify_chain_detail()
+    except Exception as exc:
+        # The message is structural (a parse position, a rejected key name),
+        # never a ledger line: nothing here echoes recorded content.
+        return "unverifiable", None, f"the ledger could not be read: {exc}"
+    status = verdict.status
+    if status == "empty" and not session.log_path.exists():
+        status = "absent"
+    return (
+        status,
+        verdict.first_broken_index if status == "broken" else None,
+        verdict.reason,
+    )
+
+
+def _verify_claim(
+    stored: dict,
+    claim: Claim,
+    manifest: Manifest,
+    entries: list,
+    events: list,
+    repo: Path,
+    ledger_objects: Optional[Path],
+) -> GradeResult:
+    """Grade one sealed claim, checking the note's binding to its evidence first.
+
+    Two paths, and the split is what protects notes published before v0.2:
+
+    - **No evidence block** — a v1 note. Regrade exactly as v0.1 regraded it,
+      unbound. There is nothing to check: the note never recorded which entry
+      backed the claim, and inventing a binding for it after the fact would be a
+      verdict about evidence this run cannot identify.
+    - **An evidence block** — check it before grading anything. If the live
+      ledger cannot supply that entry, report the SEALED grade under
+      ``witness-unavailable`` rather than recomputing a fresh verdict from
+      whatever the ledger holds now. That silent recomputation is the defect
+      this whole unit exists to close.
+    """
+    evidence = stored.get("evidence")
+    if not isinstance(evidence, dict):
+        return _regrade(claim, manifest, events, repo, ledger_objects)
+
+    sealed_grade = stored.get("grade")
+    idx = evidence.get("event_index")
+    problem = _witness_problem(entries, idx, evidence.get("entry_hash"))
+    if problem is not None:
+        return GradeResult(
+            claim,
+            GRADE_WITNESS_UNAVAILABLE,
+            reason=(
+                f"sealed as {sealed_grade} at commit {manifest.commit[:12]}; "
+                f"witness ledger unavailable ({problem})"
+            ),
+            supporting_event_index=idx if _is_index(idx) else None,
+            sealed_grade=sealed_grade,
+        )
+
+    result = _regrade(claim, manifest, events, repo, ledger_objects)
+    result.evidence_bound = True
+    result.sealed_grade = sealed_grade
+    return result
+
+
+def _is_index(value) -> bool:
+    """A real integer index. ``bool`` is an ``int`` subclass and is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _witness_problem(entries: list, idx, recorded_hash) -> Optional[str]:
+    """Why the live ledger cannot supply the sealed evidence, or None.
+
+    Two mechanisms, and they are not the same fact. The ledger may be too SHORT
+    to hold that index — the archived-ledger case, which an index-keyed regrade
+    already noticed, if only by grading everything unknown. Or it may be long
+    enough and hold a DIFFERENT entry there, which an index-keyed regrade
+    reports as a confident verdict about evidence it never saw. The second is
+    the dangerous one, so the reason names which happened.
+
+    The comparison is against the entry's STORED hash. Whether that hash is the
+    one the entry's own body recomputes to is the chain check's question, not
+    this one; conflating them would report a ledger this binary merely cannot
+    recompute as evidence that went missing.
+    """
+    if not _is_index(idx):
+        return "the sealed evidence block names no usable event index"
+    if not (0 <= idx < len(entries)):
+        return (
+            f"recorded event index {idx} is out of range "
+            f"(the live ledger holds {len(entries)} event(s))"
+        )
+    if not isinstance(recorded_hash, str) or not recorded_hash:
+        return f"the sealed evidence block carries no entry hash for index {idx}"
+    if entries[idx].entry_hash != recorded_hash:
+        return f"entry hash mismatch at index {idx}"
+    return None
+
+
+def _regrade(
+    claim: Claim,
+    manifest: Manifest,
+    events: list,
+    repo: Path,
+    ledger_objects: Optional[Path],
+) -> GradeResult:
+    try:
+        return grade(claim, manifest.tree, events, repo, ledger_objects)
+    except Exception as exc:  # object gc'd or unreadable → unknown, not crash
+        return GradeResult(claim, "unknown", reason=f"regrade failed: {exc}")
 
 
 # --- claim persistence (declared claims live in the ledger dir) --------------
@@ -296,18 +512,33 @@ def _last_seal_watermark(session: Session) -> int:
 
 
 def _record_seal(session: Session, commit: str, tree: str, claims_watermark: int) -> None:
-    with _seals_path(session).open("a", encoding="ascii") as fh:
-        fh.write(
-            canonical_json(
-                {"commit": commit, "tree": tree, "claims_watermark": claims_watermark}
-            ).decode("ascii")
-            + "\n"
-        )
+    # Private-append: these carry operator-authored labels and commit ids into
+    # the secret-bearing ledger directory, and a plain open() would create them
+    # 0666 & ~umask. canonical_json is already ascii bytes, so the byte written
+    # is unchanged from the text-mode open this replaced.
+    #
+    # Under the ledger's append lock for the same reason as declare_claim below:
+    # a seal line carries a commit id and a watermark other seals read back, so a
+    # torn one loses the watermark and re-seals every claim.
+    with _append_lock(session.root):
+        with _open_private_append(_seals_path(session)) as fh:
+            fh.write(
+                canonical_json(
+                    {"commit": commit, "tree": tree, "claims_watermark": claims_watermark}
+                )
+                + b"\n"
+            )
 
 
 def declare_claim(session: Session, claim: Claim) -> None:
-    with _claims_path(session).open("a", encoding="ascii") as fh:
-        fh.write(canonical_json(claim.to_dict()).decode("ascii") + "\n")
+    # O_APPEND is atomic only below PIPE_BUF, and a claim line is not bounded by
+    # that: every declared pathspec lengthens it. Two concurrent `didrun claim`
+    # invocations could therefore interleave into one unparseable record, so this
+    # takes the same ledger-wide lock the event append takes. Cheap by
+    # construction — one short local write, never a child process.
+    with _append_lock(session.root):
+        with _open_private_append(_claims_path(session)) as fh:
+            fh.write(canonical_json(claim.to_dict()) + b"\n")
 
 
 def _load_claims(session: Session) -> list[Claim]:
@@ -495,13 +726,42 @@ def _scan_for_secrets(session: Session, results: list[GradeResult]) -> list[reda
     return findings
 
 
-def _redact_result(r: GradeResult, session: Session) -> dict:
+def _redact_result(r: GradeResult, session: Session, entries: list) -> dict:
     d = r.to_dict()
     # Redact argv in the exported claim view.
     d["claim"]["argv_preview"] = redact.scrub_argv(
         list(_event_argv(session, r.supporting_event_index))
     )
+    block = _evidence_block(entries, r.supporting_event_index)
+    if block is not None:
+        d["evidence"] = block
     return d
+
+
+def _evidence_block(entries: list, idx: Optional[int]) -> Optional[dict]:
+    """Which recorded entry backed this claim, named by its chain hash.
+
+    This is the handle the note never had. A sealed grade used to be reachable
+    only through an integer index into whatever ledger happens to be on disk at
+    verify time, so an archived, rebuilt or substituted ledger changed the
+    verdict with no signal. The entry hash makes "index 4 of the ledger you have
+    now" checkable against "index 4 of the ledger this was sealed from".
+
+    Recorded in the MANIFEST, never in the ledger: the v1 chain preimage is
+    frozen (docs/COMPAT.md), and putting a field into Event would invalidate
+    every entry hash ever written. Omitted entirely when no event backs the
+    claim — an absent block means "nothing to bind", which is not the same fact
+    as "bound to nothing".
+    """
+    if idx is None or not (0 <= idx < len(entries)):
+        return None
+    entry = entries[idx]
+    return {
+        "event_index": idx,
+        "entry_hash": entry.entry_hash,
+        "env_fingerprint": entry.event.env_fingerprint,
+        "tree_after": entry.event.tree_after,
+    }
 
 
 def _event_argv(session: Session, idx: Optional[int]):

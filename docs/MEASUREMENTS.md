@@ -34,6 +34,38 @@ Relevant detail for Claude Code specifically: its Bash tool spawns the **user's
 `/bin/zsh -c` on a default macOS box — which is why Tier 2 is per-shell dispatch
 rather than `BASH_ENV` alone.
 
+## Capture: what the streaming pump costs (v0.2)
+
+Tier 0 drained the child through `subprocess.run(capture_output=True)` until
+v0.2, which buffers both pipes to completion — so a wrapped command surfaced
+nothing at all until it exited (measured on real sessions: single events of
+201.95 s, 332.42 s, 447.77 s and 530.21 s with no progress, and a 14.6-hour
+chain whose entire operator-visible output was one summary line per command).
+v0.2 replaces it with a `selectors` pump that drains both pipes incrementally.
+
+The question that had to be answered with numbers rather than a shrug is what
+the pump costs per spawn. Both arms measured **alternately in one process** (so
+machine load is shared, not donated to whichever arm ran during a quiet minute),
+macOS 26.5 / APFS / arm64, Python 3.14.5:
+
+| Shape | Old — `subprocess.run(capture_output=True)` | New — `selectors` pump | Delta (median) |
+|---|---|---|---|
+| `/bin/echo hi`, 200 paired runs | 2.340 ms median (mean 2.358, p90 2.601) | 2.364 ms median (mean 2.370, p90 2.628) | **+0.024 ms (+1.0%)** |
+| 1 MiB to stdout, 40 paired runs | 24.099 ms median (p90 24.661) | 23.581 ms median (p90 24.309) | **−0.517 ms (−2.1%)** |
+
+So the pump is ~24 µs per short spawn — the same order as the wrapper's own
++55 µs, and invisible next to the two tree digests a `didrun run` already pays
+(a full `run_wrapped` over `/bin/echo hi` is ~245 ms median on this machine,
+almost all of it digest). On large output it is marginally *faster* than
+`communicate()`. Both readings are single-machine and macOS-only; the Linux
+rerun this file already gates on covers this table too.
+
+What the pump does **not** change is what is recorded: the drained blobs are
+byte-identical to the buffered path's, per stream, over empty, 1 MiB, interleaved,
+non-UTF-8 (NUL-bearing) and stderr-only output, and exit codes match including
+signal deaths. That equality is the criterion, and it is a test
+(`tests/test_streaming_capture.py`), not a claim made here.
+
 ## Tree digests: why copied-index write-tree
 
 The digest must reflect staged + unstaged + **untracked** state, deterministically,
