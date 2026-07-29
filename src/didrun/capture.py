@@ -35,6 +35,13 @@ from . import gitplumbing
 # leaks a secret (redaction of captured *output* is a separate pass; see redact.py).
 _ENV_FINGERPRINT_KEYS = ("PATH", "SHELL", "LANG", "PWD", "VIRTUAL_ENV")
 
+# The fingerprint's preimage is versioned IN BAND, because the digest's shape
+# does not change when its key set does: two 16-hex strings over different key
+# sets are silently incomparable, which reads as "the environment drifted" when
+# the truth is "these were produced by different didrun versions". A bare digest
+# with no prefix was produced by v0.1 and is incomparable, not drifted.
+FINGERPRINT_VERSION = 1
+
 # The env var that gates Tier-2 traps. The trap does nothing unless this is set,
 # and it is set ONLY by `didrun run`, so an installed trap never records an
 # unrelated shell session on the machine (the privacy gate).
@@ -47,7 +54,24 @@ def env_fingerprint(env: Optional[dict] = None) -> str:
     for key in _ENV_FINGERPRINT_KEYS:
         val = env.get(key, "")
         parts.append(f"{key}={val}")
-    return hashlib.sha256("\n".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
+    digest = hashlib.sha256("\n".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
+    return f"v{FINGERPRINT_VERSION}:{digest}"
+
+
+def fingerprint_version(value: str) -> Optional[int]:
+    """The in-band version of a fingerprint, or None if it carries no prefix.
+
+    ``None`` means the value came from a didrun that predates the prefix, so it
+    is INCOMPARABLE with a versioned one — a consumer must not read a mismatch
+    between the two as environment drift.
+    """
+    prefix, sep, _digest = value.partition(":")
+    if not sep or not prefix.startswith("v"):
+        return None
+    digits = prefix[1:]
+    if not (digits.isascii() and digits.isdigit()):
+        return None
+    return int(digits)
 
 
 def run_wrapped(argv: list[str], session: Session, repo: Optional[Path] = None) -> Event:

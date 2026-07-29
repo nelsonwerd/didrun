@@ -8,3 +8,9 @@ build/
 # The ledger is secret-bearing by construction — never commit it.
 .didrun/
 *.didrun-bundle
+
+# Local-only working material (private paths, internal project references).
+# Not for publication -- this repo ships docs/ to PyPI and GitHub.
+research/
+docs/DIDRUN_V02_PACK.md
+.didrun-history/

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 
@@ -98,6 +99,57 @@ def test_ledger_excluded_from_digest_when_gitignored(repo: Path):
     (repo / ".didrun" / "objects" / "junk").write_text("noise\n")
     after = gp.tree_digest(repo)
     assert before is not None and before == after
+
+
+def _archive(repo: Path) -> None:
+    """A rotated ledger sitting under the archive root, in its usual shape."""
+    d = repo / gp.ARCHIVE_DIRNAME / "unit-01" / ".didrun"
+    d.mkdir(parents=True)
+    (d / "session.log").write_text("rotated\n")
+
+
+def test_archive_root_is_in_the_default_exclusion():
+    """The exclusion is a default, not an opt-in — a caller passing nothing
+    still gets the archive root kept out."""
+    default = inspect.signature(gp.tree_digest).parameters["exclude"].default
+    assert default == (gp.LEDGER_DIRNAME, gp.ARCHIVE_DIRNAME)
+
+
+def test_archive_gitignored_digest_is_unchanged_by_the_new_exclusion(repo: Path):
+    """The compat criterion: where the archive root IS gitignored, v0.2 digests
+    a tree to the same id v0.1 did, because `add -A` already skipped it."""
+    (repo / ".gitignore").write_text(".didrun/\n.didrun-history/\n")
+    _archive(repo)
+    v01 = gp.tree_digest(repo, exclude=(gp.LEDGER_DIRNAME,))
+    v02 = gp.tree_digest(repo)
+    assert v01 is not None and v01 == v02
+
+
+def test_archive_not_gitignored_is_a_digest_semantics_change(repo: Path):
+    """Where the archive root is NOT gitignored, v0.2 and v0.1 disagree — and
+    v0.2 is the one that excludes it. Pinned, not hidden: this is the release
+    note. Without it, archiving a ledger moves the digest of the tree that
+    just archived it and stales the unit that did the archiving."""
+    empty = gp.tree_digest(repo)  # no archive root present yet
+    _archive(repo)
+    v01 = gp.tree_digest(repo, exclude=(gp.LEDGER_DIRNAME,))
+    v02 = gp.tree_digest(repo)
+    assert v01 is not None and v02 is not None
+    assert v01 != v02          # the semantics change, stated
+    assert v02 == empty        # and v0.2 is the side that ignores the archive
+
+
+def test_ledger_dir_still_excluded_in_both_configs_with_the_archive_present(repo: Path):
+    """Adding a second exclusion must not weaken the first: `.didrun/` stays
+    out regardless of gitignore state, which is the guarantee grading rests on."""
+    _archive(repo)
+    for ignore in ("", ".didrun/\n.didrun-history/\n"):
+        (repo / ".gitignore").write_text(ignore)
+        before = gp.tree_digest(repo)
+        (repo / ".didrun" / "objects").mkdir(parents=True, exist_ok=True)
+        (repo / ".didrun" / "objects" / "junk").write_text("noise\n")
+        after = gp.tree_digest(repo)
+        assert before is not None and before == after
 
 
 def test_tree_delta_reports_exact_path(repo: Path, tmp_path: Path):

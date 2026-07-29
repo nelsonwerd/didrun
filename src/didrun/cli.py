@@ -118,7 +118,14 @@ def cmd_seal(args) -> int:
 def cmd_verify(args) -> int:
     repo = Path(args.repo or os.getcwd())
     session = _session(repo)
-    report = _manifest.verify(session, repo, commitish=args.commit or "HEAD")
+    try:
+        report = _manifest.verify(session, repo, commitish=args.commit or "HEAD")
+    except _manifest.ManifestError as exc:
+        # Evidence this binary cannot read is a graded refusal, not a crash. 2,
+        # not --strict's 1: "could not read the manifest" is a different fact
+        # from "the manifest graded badly".
+        print(f"didrun verify: {exc}", file=sys.stderr)
+        return 2
     if args.html:
         Path(args.html).write_text(render.render_html(report), encoding="utf-8")
         print(f"wrote HTML report to {args.html}")
@@ -152,7 +159,11 @@ def cmd_show(args) -> int:
             )
         return 0 if ok else 1
     # Default: the verdict view for a commit.
-    report = _manifest.verify(session, repo, commitish=args.commit or "HEAD")
+    try:
+        report = _manifest.verify(session, repo, commitish=args.commit or "HEAD")
+    except _manifest.ManifestError as exc:
+        print(f"didrun show: {exc}", file=sys.stderr)
+        return 2
     if args.html:
         Path(args.html).write_text(render.render_html(report), encoding="utf-8")
         print(f"wrote HTML report to {args.html}")

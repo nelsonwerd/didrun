@@ -56,9 +56,23 @@ class Manifest:
 
     @classmethod
     def from_json(cls, data: bytes) -> "Manifest":
+        """Parse a note body. Refuses a version it does not understand.
+
+        Refuse, never coerce: a newer manifest may have changed what an
+        existing field MEANS, and grading it under this version's semantics
+        would produce a confident verdict about a format this binary has never
+        seen. Older versions are accepted — new fields are additive and are
+        read with a v1-reproducing default (see docs/COMPAT.md).
+        """
         d = json.loads(data)
+        version = d["version"]
+        if version > MANIFEST_VERSION:
+            raise ManifestError(
+                f"manifest version {version} is newer than this didrun understands "
+                f"(max {MANIFEST_VERSION}); upgrade didrun"
+            )
         return cls(
-            version=d["version"],
+            version=version,
             commit=d["commit"],
             tree=d["tree"],
             claims=d["claims"],
@@ -155,13 +169,29 @@ def seal(
         secrets_override=bool(findings) and allow_secrets,
     )
 
+    # Publication and the watermark are one atomic pair. A published note with
+    # no watermark re-seals every earlier claim forever (the watermark is what
+    # scopes a seal); a watermark with no published note reports evidence that
+    # was never written. Nothing is recorded until the note is on the commit,
+    # and if recording fails the note goes back to what it was.
+    prior_note = _read_note(repo, commit) if write_notes else None
     if write_notes:
         _attach_note(repo, commit, manifest)
-    if bundle_path is not None:
-        Path(bundle_path).write_bytes(manifest.to_json())
 
-    # Advance the seal watermark (append-only, like everything in the ledger).
-    _record_seal(session, commit, tree, len(all_claims))
+    # Everything after publication runs inside the rollback. A caller-supplied
+    # bundle path is the likeliest failure in this function, and an exception
+    # escaping here would leave the note published with no watermark -- exactly
+    # the state the pair above exists to prevent.
+    try:
+        if bundle_path is not None:
+            Path(bundle_path).write_bytes(manifest.to_json())
+        # Advance the seal watermark (append-only, like everything in the ledger).
+        _record_seal(session, commit, tree, len(all_claims))
+    except Exception as exc:
+        raise ManifestError(
+            f"seal aborted: no watermark was recorded; "
+            f"{_rollback_note(repo, commit, prior_note, write_notes)}; cause: {exc}"
+        )
 
     return manifest
 
@@ -174,6 +204,7 @@ class VerifyReport:
     results: list[GradeResult]
     coverage: dict
     secrets_override: bool = False
+    notes_skipped: int = 0  # notes the tree fallback could not parse at all
 
     @property
     def worst_status(self) -> str:
@@ -204,7 +235,7 @@ def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyRepor
     commit = _rev(repo, commitish)
     tree = gitplumbing.commit_tree(repo, commitish) if commit else None
 
-    manifest, resolved_by = _resolve_manifest(repo, commit, tree)
+    manifest, resolved_by, notes_skipped = _resolve_manifest(repo, commit, tree)
     if manifest is None:
         return VerifyReport(
             commit=commit or "",
@@ -212,6 +243,7 @@ def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyRepor
             resolved_by="none",
             results=[],
             coverage={},
+            notes_skipped=notes_skipped,
         )
 
     # Re-grade the MANIFEST'S OWN claims against its sealed tree (deterministic
@@ -236,6 +268,7 @@ def verify(session: Session, repo: Path, commitish: str = "HEAD") -> VerifyRepor
         results=results,
         coverage=manifest.coverage,
         secrets_override=manifest.secrets_override,
+        notes_skipped=notes_skipped,
     )
 
 
@@ -298,18 +331,107 @@ def _rev(repo: Path, commitish: str) -> Optional[str]:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
-def _attach_note(repo: Path, commit: str, manifest: Manifest) -> None:
-    subprocess.run(
-        ["git", "notes", f"--ref={NOTES_REF}", "add", "-f", "-m", manifest.to_json().decode("ascii"), commit],
+def _git_stderr(proc) -> str:
+    err = proc.stderr or b""
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", "replace")
+    return err.strip()[:500]
+
+
+def _read_note(repo: Path, commit: str) -> Optional[bytes]:
+    """The note body currently attached to ``commit``, or None if there is none.
+
+    Read before publishing so a failed seal can put back what it overwrote.
+    """
+    proc = subprocess.run(
+        ["git", "notes", f"--ref={NOTES_REF}", "show", commit],
         cwd=str(repo),
         capture_output=True,
-        text=True,
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _attach_note(repo: Path, commit: str, manifest: Manifest) -> None:
+    """Publish the manifest as ``commit``'s note. Fails closed.
+
+    The body travels on stdin (``-F -``), not as an argv element: notes grow
+    with claim count and the command line does not. ``-F -`` and ``-m`` produce
+    the identical note object, so this moves no stored byte.
+    """
+    proc = subprocess.run(
+        ["git", "notes", f"--ref={NOTES_REF}", "add", "-f", "-F", "-", commit],
+        cwd=str(repo),
+        input=manifest.to_json(),
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise ManifestError(
+            f"could not publish note to {NOTES_REF} for {commit}: "
+            f"git exited {proc.returncode}: {_git_stderr(proc)}"
+        )
+
+
+def _restore_note(repo: Path, commit: str, prior: Optional[bytes]) -> bool:
+    """Put ``commit``'s note back the way it was. Best-effort; never raises.
+
+    ``_attach_note`` forces (-f), so a seal can overwrite an existing note.
+    Rolling back by REMOVING the note would turn "the watermark write failed"
+    into "the commit's earlier evidence is gone", so the prior body is
+    re-attached; removal happens only when there was nothing there before.
+    Returns whether the restore is known to have succeeded.
+    """
+    try:
+        if prior is None:
+            proc = subprocess.run(
+                ["git", "notes", f"--ref={NOTES_REF}", "remove", "--ignore-missing", commit],
+                cwd=str(repo),
+                capture_output=True,
+            )
+        else:
+            proc = subprocess.run(
+                ["git", "notes", f"--ref={NOTES_REF}", "add", "-f", "-F", "-", commit],
+                cwd=str(repo),
+                input=prior,
+                capture_output=True,
+            )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _rollback_note(
+    repo: Path, commit: str, prior: Optional[bytes], published: bool
+) -> str:
+    """Undo this seal's publication and say, exactly, what state the commit is in."""
+    if not published:
+        return "no note was published, so none was rolled back"
+    restored = _restore_note(repo, commit, prior)
+    if prior is None:
+        return (
+            "the note was rolled back and the commit was left noteless (it carried none before)"
+            if restored
+            else "the note could NOT be rolled back and this seal's note is STILL ATTACHED"
+        )
+    return (
+        "the note was rolled back and the commit's prior note was restored"
+        if restored
+        else "the note was NOT rolled back and the commit's prior note was NOT restored"
     )
 
 
 def _resolve_manifest(
     repo: Path, commit: Optional[str], tree: Optional[str]
-) -> tuple[Optional[Manifest], str]:
+) -> tuple[Optional[Manifest], str, int]:
+    """Find the manifest for a commit. Returns (manifest, resolved_by, skipped).
+
+    ``skipped`` counts notes on the tree-fallback path that could not be
+    parsed at all — a foreign note under the same ref, or a corrupt body. Those
+    are skipped so one bad note cannot hide every good one, but they are
+    counted so the caller can say so rather than reporting a silent "none".
+    A *version* refusal is not a skip: it means didrun met evidence it cannot
+    read, and it propagates.
+    """
+    skipped = 0
     # Try the note on the exact commit.
     if commit:
         proc = subprocess.run(
@@ -319,7 +441,7 @@ def _resolve_manifest(
             text=True,
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            return Manifest.from_json(proc.stdout.encode("ascii")), "commit"
+            return Manifest.from_json(proc.stdout.encode("ascii")), "commit", skipped
     # Tree fallback: scan notes for one whose sealed tree matches (survives amend).
     if tree:
         listing = subprocess.run(
@@ -343,11 +465,19 @@ def _resolve_manifest(
                 if show.returncode == 0 and show.stdout.strip():
                     try:
                         m = Manifest.from_json(show.stdout.encode("ascii"))
+                    except ManifestError:
+                        # A version this binary cannot read. Fail closed: the
+                        # alternative is scanning past it and reporting the
+                        # verdict of some older note as if it were current.
+                        raise
                     except Exception:
+                        skipped += 1
                         continue
+                    # First match wins (unchanged). Ambiguity policy is not
+                    # this unit's; see docs/COMPAT.md.
                     if m.tree == tree:
-                        return m, "tree-fallback"
-    return None, "none"
+                        return m, "tree-fallback", skipped
+    return None, "none", skipped
 
 
 def _scan_for_secrets(session: Session, results: list[GradeResult]) -> list[redact.Finding]:

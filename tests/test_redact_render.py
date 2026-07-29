@@ -52,6 +52,7 @@ def _report(results, all_verified=False, worst="stale"):
         results: list = None
         coverage: dict = None
         secrets_override: bool = False
+        notes_skipped: int = 0
 
         @property
         def worst_status(self):
@@ -90,6 +91,23 @@ def test_cli_no_color_has_text_tokens(monkeypatch):
     # never "VERIFIED" (which would overclaim — the honesty invariant).
     assert "STALE" in out and "TREE-EXACT" in out
     assert "VERIFIED" not in out
+
+
+def test_unparseable_notes_are_reported_on_both_verdict_paths(monkeypatch):
+    """"No manifest" and "there were notes and none could be read" are
+    different facts, and the second must reach the operator on the no-claims
+    path too — that is the path a repo with only foreign notes lands on."""
+    monkeypatch.setenv("NO_COLOR", "1")
+    quiet = render.render_verdict(_report([]))
+    assert "skipped" not in quiet  # never invented when the count is zero
+
+    empty = _report([], worst="empty")
+    empty.notes_skipped = 2
+    assert "2 notes skipped (unparseable)" in render.render_verdict(empty)
+
+    graded = _report([_gr("tree-exact", "t")])
+    graded.notes_skipped = 1
+    assert "1 note skipped (unparseable)" in render.render_verdict(graded)
 
 
 def test_no_surface_says_verified():

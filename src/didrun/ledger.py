@@ -21,13 +21,40 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 # The genesis link. The first entry chains from this fixed, well-known value so
 # an empty vs tampered-truncated log are distinguishable.
 GENESIS_HASH = "0" * 64
+
+# The chain preimage this binary writes. Every entry_hash ever recorded was
+# computed over version 1, so version 1's field list is frozen forever: a name
+# added to or removed from it stops every archived entry_hash reproducing.
+# A future schema adds a *new* version here and leaves 1 untouched.
+PREIMAGE_VERSION = 1
+
+# canonical_json sorts keys, so the order within each tuple does not affect the
+# digest — only membership does.
+_PREIMAGE_FIELDS: dict[int, tuple[str, ...]] = {
+    1: (
+        "argv",
+        "cwd",
+        "env_fingerprint",
+        "observed_via",
+        "coverage",
+        "exit_code",
+        "started_at",
+        "ended_at",
+        "stdout_blob",
+        "stderr_blob",
+        "transcript_blob",
+        "tree_before",
+        "tree_after",
+        "submodule_dirty",
+    ),
+}
 
 # Observation provenance. Only wrapper/shim events witnessed an actual exit code;
 # a transcript only saw bytes on a terminal and must never claim an exit code.
@@ -123,9 +150,21 @@ class Event:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Event":
-        d = dict(d)
-        d["argv"] = tuple(d.get("argv", ()))
-        return cls(**d)
+        # Unknown keys are dropped rather than fatal: a ledger written by a
+        # newer binary must stay *readable* by this one. What is dropped is not
+        # discarded silently — unknown_event_keys_of() reports it, and an entry
+        # carrying any is graded unverifiable rather than recomputed.
+        known = {k: v for k, v in d.items() if k in _EVENT_FIELD_NAMES}
+        known["argv"] = tuple(known.get("argv", ()))
+        return cls(**known)
+
+
+_EVENT_FIELD_NAMES = frozenset(f.name for f in dataclass_fields(Event))
+
+
+def unknown_event_keys_of(d: dict) -> tuple[str, ...]:
+    """Keys in a stored event body that this binary's Event schema lacks."""
+    return tuple(sorted(k for k in d if k not in _EVENT_FIELD_NAMES))
 
 
 @dataclass
@@ -136,14 +175,46 @@ class ChainEntry:
     prev_hash: str
     event: Event
     entry_hash: str = ""
+    # Neither of these is serialized into the event body or hashed; ChainEntry
+    # is built by hand, never via asdict, so they are free.
+    preimage_version: int = PREIMAGE_VERSION
+    unknown_event_keys: tuple[str, ...] = ()
 
     def compute_hash(self) -> str:
         # The hash binds the previous link, the position, and the canonical
-        # event body. Reordering, truncation, or mutation all break it.
+        # event body, projected onto the field list declared for this preimage
+        # version. Reordering, truncation, or mutation all break it. At version
+        # 1 the projection is byte-identical to the whole to_dict(), which is
+        # what keeps every archived entry_hash reproducing.
+        field_names = _PREIMAGE_FIELDS.get(self.preimage_version)
+        if field_names is None:
+            raise LedgerError(
+                f"unknown chain preimage version: {self.preimage_version}"
+            )
+        d = self.event.to_dict()
         body = canonical_json(
-            {"index": self.index, "prev": self.prev_hash, "event": self.event.to_dict()}
+            {
+                "index": self.index,
+                "prev": self.prev_hash,
+                "event": {k: d[k] for k in field_names},
+            }
         )
         return sha256_hex(self.prev_hash.encode("ascii") + body)
+
+
+@dataclass(frozen=True)
+class ChainVerdict:
+    """The honest three-way answer about a chain, not a boolean.
+
+    ``unverifiable`` is the state the boolean could not express: the entry was
+    written by something this binary does not fully understand, so its hash
+    cannot be recomputed. That is never the same statement as tamper.
+    """
+
+    status: str  # "intact" | "broken" | "unverifiable" | "empty"
+    first_broken_index: Optional[int] = None
+    unverifiable_index: Optional[int] = None
+    reason: str = ""
 
 
 class BlobStore:
@@ -231,6 +302,10 @@ class Session:
             "entry_hash": entry.entry_hash,
             "event": event.to_dict(),
         }
+        # Omitted at version 1 so a v1 record on disk stays byte-identical to
+        # what every previous release wrote, and an older binary keeps reading it.
+        if entry.preimage_version != 1:
+            rec["preimage_version"] = entry.preimage_version
         # Append one canonical line. Newline-delimited so the tail read is cheap.
         with self.log_path.open("ab") as fh:
             fh.write(canonical_json(rec) + b"\n")
@@ -247,16 +322,81 @@ class Session:
                 if not line:
                     continue
                 rec = json.loads(line)
+                body = rec["event"]
                 entry = ChainEntry(
                     index=rec["index"],
                     prev_hash=rec["prev_hash"],
-                    event=Event.from_dict(rec["event"]),
+                    event=Event.from_dict(body),
                     entry_hash=rec["entry_hash"],
+                    # Absent means version 1: that is what every archived
+                    # record looks like and it must keep meaning v1.
+                    preimage_version=rec.get("preimage_version", 1),
+                    unknown_event_keys=unknown_event_keys_of(body),
                 )
                 yield entry
 
     def events(self) -> list[Event]:
         return [e.event for e in self.entries()]
+
+    def verify_chain_detail(self) -> ChainVerdict:
+        """Recompute the chain and report which of the four states it is in.
+
+        Stops at the first entry that is broken or that cannot be recomputed.
+        An entry this binary cannot recompute — an unknown preimage version, or
+        event keys outside the version's declared-exhaustive field list — is
+        ``unverifiable``: the projection would quietly hash a subset and
+        reproduce the stored digest, so reporting ``intact`` there would be a
+        lie and reporting ``broken`` would be a different one.
+        """
+        prev = GENESIS_HASH
+        expected_index = 0
+        seen = False
+        for entry in self.entries():
+            seen = True
+            if entry.index != expected_index:
+                return ChainVerdict(
+                    "broken",
+                    first_broken_index=entry.index,
+                    reason=(
+                        f"entry index {entry.index} out of sequence "
+                        f"(expected {expected_index})"
+                    ),
+                )
+            if entry.prev_hash != prev:
+                return ChainVerdict(
+                    "broken",
+                    first_broken_index=entry.index,
+                    reason=f"entry {entry.index} does not link to the previous entry",
+                )
+            if entry.unknown_event_keys:
+                return ChainVerdict(
+                    "unverifiable",
+                    unverifiable_index=entry.index,
+                    reason=(
+                        f"entry {entry.index} carries event keys this binary does "
+                        f"not know ({', '.join(entry.unknown_event_keys)}); its "
+                        f"preimage cannot be recomputed"
+                    ),
+                )
+            try:
+                recomputed = entry.compute_hash()
+            except LedgerError as exc:
+                return ChainVerdict(
+                    "unverifiable",
+                    unverifiable_index=entry.index,
+                    reason=f"entry {entry.index}: {exc}",
+                )
+            if recomputed != entry.entry_hash:
+                return ChainVerdict(
+                    "broken",
+                    first_broken_index=entry.index,
+                    reason=f"entry {entry.index} does not recompute to its stored hash",
+                )
+            prev = entry.entry_hash
+            expected_index += 1
+        if not seen:
+            return ChainVerdict("empty")
+        return ChainVerdict("intact")
 
     def verify_chain(self) -> tuple[bool, Optional[int]]:
         """Recompute the chain. Returns (ok, first_broken_index).
@@ -264,16 +404,16 @@ class Session:
         ``first_broken_index`` is the index whose stored hash or linkage does
         not recompute — the earliest point tamper is detectable. ``None`` when
         the chain is intact.
+
+        A thin wrapper over ``verify_chain_detail``; anything other than intact
+        or empty is ``ok=False``, including ``unverifiable``, which collapses to
+        the same boolean but is never the same fact. Callers that need to tell
+        "cannot recompute" from "tamper" must use ``verify_chain_detail``. This
+        signature is depended on and does not change.
         """
-        prev = GENESIS_HASH
-        expected_index = 0
-        for entry in self.entries():
-            if entry.index != expected_index:
-                return False, entry.index
-            if entry.prev_hash != prev:
-                return False, entry.index
-            if entry.compute_hash() != entry.entry_hash:
-                return False, entry.index
-            prev = entry.entry_hash
-            expected_index += 1
-        return True, None
+        verdict = self.verify_chain_detail()
+        if verdict.status in ("intact", "empty"):
+            return True, None
+        if verdict.status == "broken":
+            return False, verdict.first_broken_index
+        return False, verdict.unverifiable_index

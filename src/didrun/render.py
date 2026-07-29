@@ -66,6 +66,15 @@ def _sanitize(s: str) -> str:
     return "".join(out)
 
 
+def _skipped_notes(n: int) -> str:
+    """Notes under the didrun ref that could not be parsed at all.
+
+    Reported rather than swallowed: "no manifest" and "there were notes here
+    and none of them could be read" are different facts.
+    """
+    return f"{n} note{'' if n == 1 else 's'} skipped (unparseable)"
+
+
 def render_verdict(report, width: int = 80) -> str:
     """Render a VerifyReport as the CLI instrument panel."""
     lines: list[str] = []
@@ -75,6 +84,8 @@ def render_verdict(report, width: int = 80) -> str:
     if worst == "empty":
         lines.append(_c("○ NO CLAIMS", "33") + "  nothing sealed for this commit")
         lines.append(f"  commit {report.commit[:12] or '(none)'} · resolved-by {report.resolved_by}")
+        if report.notes_skipped:
+            lines.append(_c(f"  ! {_skipped_notes(report.notes_skipped)}", "33"))
         return "\n".join(lines)
 
     token, color, marker, _gloss = _GRADE_DISPLAY.get(worst, ("UNKNOWN", "33", "?", ""))
@@ -92,6 +103,8 @@ def render_verdict(report, width: int = 80) -> str:
     )
     if report.secrets_override:
         lines.append(_c("  ! sealed with --allow-secrets (redacted export)", "33"))
+    if report.notes_skipped:
+        lines.append(_c(f"  ! {_skipped_notes(report.notes_skipped)}", "33"))
     lines.append("")
 
     # Per-claim table. Failing/stale first (already sorted).

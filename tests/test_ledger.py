@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import textwrap
@@ -10,12 +11,14 @@ from pathlib import Path
 import pytest
 
 from didrun.ledger import (
+    GENESIS_HASH,
     Event,
     Session,
     BlobStore,
     LedgerError,
     canonical_json,
     sha256_hex,
+    unknown_event_keys_of,
 )
 
 
@@ -124,3 +127,145 @@ def test_self_stability_precondition():
     assert ev.self_stable()
     ev2 = _wrapper_event(tree_before="aaa", tree_after="bbb")
     assert not ev2.self_stable()
+
+
+# --- P0.2 — the frozen v1 preimage, unknown keys, unknown versions -----------
+
+
+def _records(session: Session) -> list[dict]:
+    return [json.loads(l) for l in session.log_path.read_text().splitlines() if l.strip()]
+
+
+def _rewrite(session: Session, records: list[dict]) -> None:
+    session.log_path.write_bytes(b"".join(canonical_json(r) + b"\n" for r in records))
+
+
+def test_v1_record_on_disk_carries_no_preimage_version_key(tmp_path: Path):
+    """A v1 record must stay byte-shaped exactly as every previous release
+    wrote it, so an older binary keeps reading a ledger this one produced."""
+    s = Session(tmp_path / ".didrun")
+    s.append(_wrapper_event())
+    rec = _records(s)[0]
+    assert set(rec) == {"index", "prev_hash", "entry_hash", "event"}
+
+
+def test_archived_shape_record_round_trips(tmp_path: Path):
+    """A record with no preimage_version key — i.e. every archived record —
+    reads back, recomputes, and grades intact.
+
+    The expected hash is spelled out here with the pre-P0.2 preimage rather
+    than borrowed from compute_hash(), so this fails if the projection ever
+    stops being byte-identical to the whole event body at version 1.
+    """
+    s = Session(tmp_path / ".didrun")
+    body = _wrapper_event(argv=("cmd", "0")).to_dict()
+    stored = sha256_hex(
+        GENESIS_HASH.encode("ascii")
+        + canonical_json({"index": 0, "prev": GENESIS_HASH, "event": body})
+    )
+    _rewrite(
+        s,
+        [{"index": 0, "prev_hash": GENESIS_HASH, "entry_hash": stored, "event": body}],
+    )
+
+    entries = list(s.entries())
+    assert len(entries) == 1
+    assert entries[0].preimage_version == 1
+    assert entries[0].unknown_event_keys == ()
+    assert entries[0].event.argv == ("cmd", "0")  # argv tuple-ization survives
+    assert entries[0].compute_hash() == stored
+    assert s.verify_chain_detail().status == "intact"
+    assert s.verify_chain() == (True, None)
+
+
+def test_unknown_event_key_is_readable_but_unverifiable(tmp_path: Path):
+    """A ledger written by a newer binary must stay readable, and must not be
+    reported as tamper — but must never be reported as intact either."""
+    s = Session(tmp_path / ".didrun")
+    s.append(_wrapper_event())
+    recs = _records(s)
+    recs[0]["event"]["umask"] = "0022"
+    _rewrite(s, recs)
+
+    # Readable, not fatal: no TypeError out of cls(**d).
+    ev = Event.from_dict(recs[0]["event"])
+    assert ev.argv == ("echo", "hi")
+    assert unknown_event_keys_of(recs[0]["event"]) == ("umask",)
+
+    entries = list(s.entries())
+    assert entries[0].unknown_event_keys == ("umask",)
+    # This is exactly why unverifiable has to exist: the projection cannot see
+    # the extra key, so the recomputed hash still matches and a hash check
+    # alone would call this chain intact.
+    assert entries[0].compute_hash() == entries[0].entry_hash
+
+    verdict = s.verify_chain_detail()
+    assert verdict.status == "unverifiable"
+    assert verdict.unverifiable_index == 0
+    assert verdict.first_broken_index is None
+    assert "umask" in verdict.reason
+
+    ok, idx = s.verify_chain()
+    assert ok is False
+    assert idx == 0
+
+
+def test_unknown_preimage_version_fails_closed(tmp_path: Path):
+    s = Session(tmp_path / ".didrun")
+    for i in range(3):
+        s.append(_wrapper_event(argv=("cmd", str(i))))
+    recs = _records(s)
+    recs[1]["preimage_version"] = 2
+    _rewrite(s, recs)
+
+    entries = list(s.entries())
+    assert entries[1].preimage_version == 2
+    with pytest.raises(LedgerError):
+        entries[1].compute_hash()
+
+    verdict = s.verify_chain_detail()
+    assert verdict.status == "unverifiable"
+    assert verdict.unverifiable_index == 1
+    assert verdict.first_broken_index is None
+    assert "2" in verdict.reason
+
+
+def test_verify_chain_reports_rather_than_raises_on_unknown_version(tmp_path: Path):
+    """compute_hash now raises on an unknown version. A reader that crashes is
+    worse than one that reports, so the boolean wrapper must still return."""
+    s = Session(tmp_path / ".didrun")
+    for i in range(3):
+        s.append(_wrapper_event(argv=("cmd", str(i))))
+    recs = _records(s)
+    recs[1]["preimage_version"] = 2
+    _rewrite(s, recs)
+
+    ok, idx = s.verify_chain()  # must not raise
+    assert ok is False
+    assert idx == 1
+
+
+def test_mutated_event_body_is_broken_not_unverifiable(tmp_path: Path):
+    """Tamper inside a known field is still tamper — unverifiable must not
+    become a laundering route for a mutated body."""
+    s = Session(tmp_path / ".didrun")
+    for i in range(5):
+        s.append(_wrapper_event(argv=("cmd", str(i))))
+    recs = _records(s)
+    recs[1]["event"]["argv"] = ["cmd", "tampered"]
+    _rewrite(s, recs)
+
+    verdict = s.verify_chain_detail()
+    assert verdict.status == "broken"
+    assert verdict.first_broken_index == 1
+    assert verdict.unverifiable_index is None
+
+    ok, idx = s.verify_chain()
+    assert ok is False
+    assert idx == 1
+
+
+def test_empty_chain_verdict(tmp_path: Path):
+    s = Session(tmp_path / ".didrun")
+    assert s.verify_chain_detail().status == "empty"
+    assert s.verify_chain() == (True, None)
