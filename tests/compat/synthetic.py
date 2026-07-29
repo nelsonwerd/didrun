@@ -208,6 +208,48 @@ def _claim_entry(
     return d
 
 
+def _conjunction_entry(
+    label: str,
+    grade: str,
+    conjunct_grades: tuple,
+    declared_at: int,
+) -> dict:
+    """One graded conjunction, in the shape seal() writes into a v3 note.
+
+    ``grade`` is declared, not derived: every value in this fixture is a literal
+    so the legs measure the instrument against a shape whose every field is
+    stated. It binds no event and declares no pathspec, so its `argv_preview` is
+    empty — the same thing seal() writes for a claim with no supporting event.
+    """
+    result = GradeResult(
+        claim=Claim(
+            ctype="conjunction",
+            label=label,
+            event_indices=(),
+            declared_at_index=declared_at,
+            conjuncts=tuple(name for name, _g in conjunct_grades),
+        ),
+        grade=grade,
+        reason="synthetic fixture",
+        conjunct_grades=conjunct_grades,
+    )
+    d = result.to_dict()
+    d["claim"]["argv_preview"] = []
+    return d
+
+
+def _strip_post_v2_claim_keys(body: dict) -> None:
+    """Remove the claim keys no note before v3 carried.
+
+    ``Claim.to_dict`` emits ``conjuncts`` for every claim, so a body built from
+    the current dataclass carries it whatever version number the fixture stamps
+    on the manifest. A note that says version 1 and holds a v3 claim shape would
+    make the older legs read as passing on a shape they never see in an archive.
+    """
+    for entry in body.get("claims", []):
+        entry.get("claim", {}).pop("conjuncts", None)
+
+
 def _coverage() -> dict:
     return {"events": 3, "complete": 3, "observed_text_only": 0, "display_only": 0}
 
@@ -266,10 +308,13 @@ def build_corpus(root: Path) -> SyntheticCorpus:
     broken[1]["entry_hash"] = ("0" if stored[0] != "0" else "1") + stored[1:]
     _write_log(history / "unit-07-broken-hash" / ".didrun" / "session.log", broken)
 
-    # Two notes. The second deliberately omits `secrets_override` — the one key
-    # from_json already reads with a v1-reproducing default — so the round-trip
-    # leg's additive-key allowlist is exercised by the good path, not only by a
-    # meta-test.
+    # Four notes, one per manifest version this binary must read plus one that
+    # exercises the additive-key allowlist. The second deliberately omits
+    # `secrets_override` — the one key from_json already reads with a
+    # v1-reproducing default — so the allowlist is exercised by the good path and
+    # not only by a meta-test. The version ladder is covered on purpose: v3 is
+    # what this build writes, and a leg that only ever reads the version it wrote
+    # would say nothing about the 65 v1 notes already published.
     commit_a = _commit(root, "work-a.txt", "one\n")
     manifest_a = Manifest(
         version=MANIFEST_VERSION,
@@ -287,10 +332,13 @@ def build_corpus(root: Path) -> SyntheticCorpus:
     )
     _attach_note(root, commit_a, manifest_a.to_json())
 
+    # A v2 note: the version before the claim vocabulary gained `conjunction`.
+    # Pinned to the literal 2 rather than MANIFEST_VERSION so this leg keeps
+    # reading a note one version behind whatever this build writes.
     commit_b = _commit(root, "work-b.txt", "two\n")
     body_b = json.loads(
         Manifest(
-            version=MANIFEST_VERSION,
+            version=2,
             commit=commit_b,
             tree=_SYNTHETIC_TREE,
             claims=[_claim_entry("tests-pass", "suite", "failed", 0, 0, exit_code=1)],
@@ -299,7 +347,50 @@ def build_corpus(root: Path) -> SyntheticCorpus:
         ).to_json()
     )
     del body_b["secrets_override"]
+    _strip_post_v2_claim_keys(body_b)
     _attach_note(root, commit_b, canonical_json(body_b))
+
+    # A v3 note carrying a conjunction: the claim shape the vocabulary extension
+    # added. It binds no event and names its members by label, and the note holds
+    # what each member earned beside the grade the conjunction took from them.
+    commit_c = _commit(root, "work-c.txt", "three\n")
+    manifest_c = Manifest(
+        version=MANIFEST_VERSION,
+        commit=commit_c,
+        tree=_SYNTHETIC_TREE,
+        claims=[
+            _claim_entry("tests-pass", "unit", "tree-exact", 0, 0),
+            _claim_entry("lint-clean", "lint", "tree-exact", 1, 1),
+            _conjunction_entry(
+                "release",
+                "tree-exact",
+                (("unit", "tree-exact"), ("lint", "tree-exact")),
+                2,
+            ),
+        ],
+        coverage=_coverage(),
+        secrets_override=False,
+    )
+    _attach_note(root, commit_c, manifest_c.to_json())
+
+    # A v1 note, in the shape the archives actually hold one: none of the keys
+    # any later version added. Every one of them is on v1's additive allowlist,
+    # so this is the leg's statement that a note published before v0.2 still
+    # round-trips under a reader three versions later.
+    commit_d = _commit(root, "work-d.txt", "four\n")
+    body_d = json.loads(
+        Manifest(
+            version=1,
+            commit=commit_d,
+            tree=_SYNTHETIC_TREE,
+            claims=[_claim_entry("tests-pass", "suite", "tree-exact", 0, 0)],
+            coverage=_coverage(),
+        ).to_json()
+    )
+    for added_after_v1 in ("secrets_override", "secrets", "claims_from", "claims_to"):
+        del body_d[added_after_v1]
+    _strip_post_v2_claim_keys(body_d)
+    _attach_note(root, commit_d, canonical_json(body_d))
 
     expected = Expectations(
         log_statuses=(
@@ -313,16 +404,19 @@ def build_corpus(root: Path) -> SyntheticCorpus:
         ),
         log_entries=(3, 1, 2, 1, 1, 0, 3),
         objects={"dirs": 2, "flat-64hex": 3, "git-fanout": 3},
-        notes=2,
+        notes=4,
         claim_shape={
-            "notes": 2,
-            "claims": 4,
+            "notes": 4,
+            "claims": 8,
+            # The conjunction binds no event, so it is not a multi-index claim
+            # and never becomes one: that shape is what the design review ruled
+            # out, and this counter is the leg that would catch it arriving.
             "multi-index": 0,
             "max-pathspecs": 1,
-            "pathspecs": {0: 3, 1: 1},
+            "pathspecs": {0: 7, 1: 1},
             "gap-ge-1": 2,
             "gap-ge-5": 1,
-            "grades": {"failed": 1, "scope-exact": 1, "stale": 1, "tree-exact": 1},
+            "grades": {"failed": 1, "scope-exact": 1, "stale": 1, "tree-exact": 5},
         },
     )
     return SyntheticCorpus(root=root, expected=expected)

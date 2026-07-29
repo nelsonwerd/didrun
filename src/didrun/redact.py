@@ -70,8 +70,8 @@ TIER_NOTICE = "notice"
 TIERS = (TIER_BLOCK, TIER_NOTICE)
 
 # Where a finding is. `argv`/`stdout`/`stderr` address a recorded event;
-# `label`, `pathspec` and `delta-path` address individual exported claim fields;
-# `manifest` addresses the serialized bytes about to be published.
+# `label`, `pathspec`, `delta-path` and `reason` address individual exported
+# claim fields; `manifest` addresses the serialized bytes about to be published.
 SOURCE_KINDS = (
     "argv",
     "stdout",
@@ -79,12 +79,13 @@ SOURCE_KINDS = (
     "label",
     "pathspec",
     "delta-path",
+    "reason",
     "manifest",
 )
 
 # Source kinds that address ONE exported field rather than a stream of bytes.
 # A line number inside them would always be 1, which is noise, not locality.
-_LINELESS_KINDS = ("argv", "label", "pathspec", "delta-path")
+_LINELESS_KINDS = ("argv", "label", "pathspec", "delta-path", "reason")
 
 
 @dataclass(frozen=True)

@@ -304,9 +304,20 @@ def test_leg1_chain_recompute(replay_source):
 # version legitimately lacks it, and both allowlists carry it. This entry is
 # the deliberate one-line diff the criterion exists to force — without it the
 # round-trip leg would go red across every stored note at once.
+# `claims_from`/`claims_to` are P4.1's: the half-open claim window the seal
+# covered, which made a truncating re-seal visible in the artifact. Both are read
+# with a default (0 / len(claims)), so a stored note of either version
+# legitimately lacks them and both allowlists carry them. Second deliberate
+# one-line diff this criterion has forced, and the reason it exists.
+# Version 3 is P4.2's: the claim-type vocabulary gained `conjunction`. That bump
+# added no TOP-LEVEL manifest key — the conjunct list and the per-conjunct grades
+# live inside a claim entry, and a claim entry round-trips verbatim — so v3's
+# allowlist is v2's. It is spelled out rather than aliased so that a v3-only
+# additive key stays a deliberate one-line diff here, exactly as for v1 and v2.
 MANIFEST_ADDITIVE_KEYS = {
-    1: frozenset({"secrets_override", "secrets"}),
-    2: frozenset({"secrets_override", "secrets"}),
+    1: frozenset({"secrets_override", "secrets", "claims_from", "claims_to"}),
+    2: frozenset({"secrets_override", "secrets", "claims_from", "claims_to"}),
+    3: frozenset({"secrets_override", "secrets", "claims_from", "claims_to"}),
 }
 
 

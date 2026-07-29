@@ -93,7 +93,8 @@ didrun verify --html evidence.html
 
 The report is a single file with zero external assets — it opens offline and
 prints cleanly. Redaction covers the sealed note: every exported claim string —
-the `argv_preview`, the label, the pathspecs and the changed paths — is
+the `argv_preview`, the label, the pathspecs, the changed paths, the conjuncts
+and the reason — is
 redacted, and the projection is declared in the manifest. The HTML report
 carries no argv at all and renders the note's redacted label, but a stale
 claim's file list is recomputed against your working tree at verify time and is
@@ -146,7 +147,7 @@ correct or that the command meaningfully tested anything.
 ## The five commands
 
 - `didrun run -- <cmd>` — record a wrapped execution (complete capture).
-- `didrun claim <type> [--path <spec>]` — declare a structured claim.
+- `didrun claim <type> [--path <spec>]` — declare a structured claim. `didrun claim conjunction --label REL --of a,b,c` declares one over other claims in the same seal window: it is graded as the worst of them and can never be better than any one of them.
 - `didrun seal` — compile a commit-bound evidence manifest (redacts secrets; refuses when a structured secret is found in what it is about to publish, warns about the rest).
 - `didrun verify [--strict] [--require-env-match] [--html <file>]` — check claims against recorded evidence.
 - `didrun show [--session]` — show the verdict, or the recorded session history.

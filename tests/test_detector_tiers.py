@@ -580,7 +580,12 @@ def test_a_blocked_seal_advances_nothing(repo: Path):
         Claim(ctype="tests-pass", label="second unit", event_indices=(0,),
               declared_at_index=0),
     )
-    m = M.seal(s, repo)
+    # `reseal=True` because this seals the SAME commit a second time with a
+    # narrower window ([1,2) over a note that records [0,1)), which P4.1 refuses
+    # by default — that narrowing is the data-loss path it closes. What this test
+    # is about is a blocked seal advancing nothing, so the flag keeps its subject
+    # intact rather than the assertion below being softened.
+    m = M.seal(s, repo, reseal=True)
     assert [c["claim"]["label"] for c in m.claims] == ["second unit"]
 
 

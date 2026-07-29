@@ -77,6 +77,55 @@ The evidence block lives in the manifest, never in an `Event`. Putting it into t
 preimage would invalidate every `entry_hash` ever written — the break the frozen preimage
 above exists to prevent.
 
+### Version 3 — the claim-type vocabulary gained `conjunction`
+
+**A v3 note may contain a claim whose `ctype` is `conjunction`, and reading it in a binary
+whose claim vocabulary does not include that type is not a graded refusal but an uncaught
+traceback: `verify` calls `Claim.from_dict` outside the `try` that grades a claim, so
+`ClaimError: unknown claim type: 'conjunction'` propagates out of the command.** That is
+the vocabulary break, stated at full strength — "raises" understates it, and the
+`MANIFEST_VERSION` bump to 3 exists so a v0.1 or early-v0.2 reader refuses the note on its
+version *before* it reaches the claim it cannot parse.
+
+There is no way to extend a closed vocabulary without that break. The alternative —
+skipping claim types a reader does not know — is worse: the note would silently
+under-report, and print a verdict over the claims it happened to understand.
+
+A `conjunction` claim names other claims in the same seal window **by label** and is graded
+as the **worst** of them under the same severity order the whole-report verdict uses, so it
+can never be better than any one of its members. It binds no event (`event_indices` is
+required to be empty) and carries no `evidence` block; `verify` grades it in a second pass,
+against the results of the other claims **in that same note** — never against the live
+`claims.jsonl`, which would let a claim declared after the seal change an old commit's
+verdict. A conjunct label that names no live claim in the window, or more than one, grades
+the conjunction `unknown` and the reason names it.
+
+Two additive keys carry it, both read with `.get()`:
+
+```json
+"claim": {"ctype": "conjunction", "label": "REL", "event_indices": [],
+          "conjuncts": ["unit", "lint"]},
+"conjunct_grades": [{"label": "unit", "grade": "tree-exact"},
+                    {"label": "lint", "grade": "stale"}]
+```
+
+`claim.conjuncts` is emitted for every claim (as `[]` for the ones that name none, like
+`pathspecs`); `conjunct_grades` appears only on a conjunction, and a member's `grade` is
+`null` when the name resolved to nothing — an unresolved name has no grade, and giving it
+one would be an invented fact.
+
+**What it does NOT do.** It does not reconstitute an execution witness. A design review
+declined a proposal to replace recorded executions with a transition marker, on the ground
+that a marker witnesses *that a transition occurred*, not *that the command ran and exited
+0* — that refusal stands and nothing here attempts it. A conjunction substitutes for
+nothing: every conjunct keeps its own witnessed exit code and its own tree comparison, and
+the conjunction asserts nothing its members do not already back.
+
+Stored evidence is unaffected. Archived notes contain no conjunction and stay `version: 1`;
+`conjuncts` is additive with a `()` default, so every archived note reads exactly as it did.
+The break is forward-only, and it is the same shape as v2's: **upgrade the verifier before
+the sealer.**
+
 When didrun falls back to resolving a manifest by tree id it scans the notes ref. A note
 it cannot parse at all — a foreign note under the same ref, a corrupt body — is skipped
 and counted, and the count is reported, so one bad note cannot hide every good one. A
@@ -145,8 +194,13 @@ A v0.2 `redaction` block carries a second, additive list beside `applied`:
 
 `applied` is unchanged and stays argv-addressed by `argv_index`; `fields` is addressed
 by field name, because a label has no argv index. Field names in v0.2 are `claim.label`,
-`claim.pathspecs[i]` and `delta[i].path`. A reader that does not know the key sees
-exactly the argv projection it always did.
+`claim.pathspecs[i]`, `delta[i].path`, `claim.conjuncts[i]` and `reason`. A reader that
+does not know the key sees exactly the argv projection it always did.
+
+`claim.conjuncts[i]` is scanned as a **label**, because that is what a conjunct name is —
+the label of another claim in the same window. Both sides of the match are therefore
+redacted by the same deterministic projection, which is what keeps a conjunction resolvable
+at verify time even when a conjunct's label carried a secret.
 
 This exists because blocking and redacting were not the same set. A structured secret in
 a claim label refused the seal — and the refusal says *"re-run with `--allow-secrets` to
@@ -188,6 +242,48 @@ labels and delta paths that were previously published entirely unscanned. Findin
 confined to the local output blobs, and every `notice`-tier finding, warn on stderr and
 do not stop the seal. So some previously-refused seals now pass and some previously
 passing ones now refuse; both directions are measured in MEASUREMENTS.md.
+
+## The claim window is recorded, and a narrowing re-seal is refused
+
+A v0.2 manifest carries two additive top-level integers, `claims_from` and `claims_to` —
+the half-open range of the session's declared claims this note covers. They are read with
+`.get()` and defaults of `0` and `len(claims)`, so no stored note changes meaning and
+`MANIFEST_VERSION` does not bump. The compat harness's per-version allowlist carries both
+for v1 and v2: the second deliberate one-line diff that criterion has forced.
+
+A claim entry may also carry an additive `superseded_by` — the index, within the same
+note's claim list, of a later claim declaring the same `(ctype, label)`. `verify` excludes
+a superseded entry from the verdict and from `worst_status`, and reports the count. The
+entry keeps its grade, its reason and its delta verbatim: supersession subtracts from the
+verdict, never from the record. A mark that is not a forward index into the same note's
+claims carrying the same `(ctype, label)` is dropped, which *counts* the claim. That is
+fail-closed reading, not a forgery barrier — whoever can rewrite a note can rewrite a
+grade directly.
+
+**What this changes for evidence already in the world.**
+
+- **Reading is unaffected.** Both fields are additive with reading defaults, so every
+  archived note verifies exactly as it did, down to the reason string. An absent window is
+  *unknown*, not `[0, N)`: the refusal below reads key presence off the raw body rather
+  than a parsed default, precisely so a legacy note is never treated as containable.
+- **Re-sealing an already-sealed commit now requires `--reseal`** unless the new window
+  contains the recorded one. This is a deliberate behaviour break, and it is the data-loss
+  path being closed: `git notes add -f` force-replaces and a seal is scoped to
+  `all_claims[watermark:]`, so re-sealing the same commit published a note holding only
+  the post-watermark claims and silently destroyed everything the earlier note held. A
+  superset re-seal (the watermark-rotation case) still needs no flag. With `--reseal` the
+  narrowing happens and is visible in `claims_from` / `claims_to` afterwards.
+- **An absent `seals.jsonl` warns.** The watermark lives in a local, gitignored, unhashed
+  file, and its *absence* is not visible from the note: delete it and every later seal
+  silently re-covers the whole claim history. Measured where it matters most — only 62 of
+  167 archived ledgers carried a `seals.jsonl` at all. The seal proceeds (rotation is a
+  legitimate workflow, and a session's first seal is indistinguishable from a rotated one
+  from inside `seal`) but it says so on stderr.
+
+**What it does not do.** Claiming a gate repeatedly until one attempt goes green is not
+prevented. Every attempt is retained in the note and the retired count is printed on both
+surfaces, so it is visible — which is the honest bound, and strictly better than the
+invisible truncation it replaces.
 
 ## The environment fingerprint is versioned in band
 
@@ -370,12 +466,84 @@ stops, not a plan.
    is a `notice`-tier detector either way. Nothing in the rule resists an attacker who
    knows it — the rule is published here, and satisfying it deliberately is trivial.
 
-3. **`reason` and `coverage` are exported unredacted.** Both are didrun's own generated
-   text — grade names, counts, path *counts* — and carry no operator or repository
-   string today. That is a property of the current generators, not an enforced
-   invariant: a future `reason` that interpolates a path or a label would leave the
-   redacted set without anything failing. The whole-blob manifest scan still *blocks* on
-   such a field, so the failure mode would be a blocked seal, not a silent leak.
+3. **`coverage` is exported unredacted.** It is didrun's own generated text — grade names
+   and counts — and carries no operator or repository string today. That is a property of
+   the current generator, not an enforced invariant. The whole-blob manifest scan still
+   *blocks* on such a field, so the failure mode would be a blocked seal, not a silent leak.
+
+   **`reason` was in this bullet until v3, and v3 is the change that took it out.** The
+   note in the previous edition said a future `reason` interpolating a path or a label would
+   leave the redacted set with nothing failing — and a conjunction's reason names a conjunct,
+   which is operator-authored. So `reason` is now redacted for every claim by the same pass
+   that reports it to the export gate, under the field name `reason`, rather than only for
+   the claim type that made it necessary: a field a later version interpolates something
+   into is then covered without anyone remembering. For every other claim type the reason
+   is generated text with nothing to find, so no stored or newly published note changes.
+
+## An unreadable note is a graded refusal
+
+`verify` refuses a note body it cannot parse, with exit 2 and a reason naming what is
+wrong, and it does that for every malformed shape rather than for the ones someone
+remembered. The refusal type is `ManifestFormatError`, a subclass of `ManifestError`.
+
+This was measured broken. Over 22 malformed note shapes, the pre-fix reader left an
+uncaught `KeyError` / `TypeError` / `JSONDecodeError` / `ClaimError` traceback on 11 of
+them and exited **1** — which is `--strict`'s "this note graded badly" code, so a corrupt
+note was indistinguishable from an honest failure by exit status. Worse, it **accepted**
+four: `{"version": true}` verified green at exit 0, because `bool` is an `int` subclass and
+`True > 3` is False. `2.5`, `0` and `-1` did the same.
+
+The accepted set is why this matters more than tidiness. The "Version 3" section above
+rests the whole forward-compatibility story on the version guard — the `MANIFEST_VERSION`
+bump exists so an older reader refuses a v3 note *on its version* before it reaches the
+claim vocabulary it cannot parse. A guard a malformed field walks past is not a guard.
+`version` is now read with the same rule `superseded_by` gets (`_is_index`, which rejects
+`bool`) and must be an integer >= 1.
+
+**The two refusals stay distinguishable, and the distinction is load-bearing.** A
+malformed body is a `ManifestFormatError`; an integer version above `MANIFEST_VERSION`
+stays a plain `ManifestError` with the `upgrade didrun` message. On the tree-fallback scan a
+format error is **skipped and counted** (a foreign note under the same ref must not hide
+every good one) while a too-new version **propagates** (scanning past it would report some
+older note's verdict as if it were current). Before, that split was made by accident — the
+scan caught bare `Exception`, so a malformed body was skipped only because `json` happened
+to raise something that was not a `ManifestError`.
+
+`verify` also no longer raises out of the command on a claim type it cannot read. The
+"Version 3" section notes that `Claim.from_dict` is called outside the `try` that grades a
+claim; that hole is now closed from this end too, as a whole-manifest refusal naming the
+entry. A per-claim `unknown` was rejected for the reason that section already gives: it
+would print a verdict over the claims this binary happened to understand.
+
+**This is fail-closed reading, not a forgery barrier**, and it is the same caveat
+`superseded_by` carries. Whoever can rewrite a note can rewrite a grade directly
+(docs/TRUST_MODEL.md). Nothing above resists an attacker; it stops a corrupt or foreign
+note from being read as a verdict.
+
+Stored evidence is unaffected: every note ever published carries an integer version of 1, 2
+or 3 and the required fields, so nothing legitimately published is newly refused. The
+compat corpus replays all three versions.
+
+## Known, not closed
+
+Small things measured and left alone, recorded rather than dropped. None of them can
+produce a green verdict that the evidence does not back.
+
+- **A duplicate conjunct label is counted twice.** `--of a,a` grades correctly (the worst
+  of the two resolutions of `a`, which is `a`'s grade) but the reason reads `worst of 2
+  conjunct(s)` for one distinct member, and `conjunct_grades` carries the pair twice.
+  Deduplicating would silently rewrite what the operator declared, which is worse than a
+  cosmetically odd count; refusing a duplicate is the better fix and is not built.
+- **`didrun claim conjunction` in a session with no recorded events** refuses with "no
+  recorded events to bind to (run something first)". A conjunction binds no event, so the
+  wording is not its refusal — but a session with no events has no claims either, so a
+  conjunction there could only ever grade `unknown`, and the early refusal is correct even
+  though the sentence is borrowed.
+- **A conjunction's `reason` names a conjunct, and the reason is redacted as one string.**
+  Both the reason and the conjunct label go through the same deterministic projection, so a
+  secret in a label is redacted in both places; but the redacted reason is not guaranteed to
+  contain the redacted label as a substring, because the two are scanned as separate fields.
+  Resolution never reads the reason, so this affects display only.
 
 ## Two things v0.2 does not close
 

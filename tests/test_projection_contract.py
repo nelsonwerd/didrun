@@ -266,11 +266,18 @@ _README = Path(__file__).resolve().parents[1] / "README.md"
 # list for a stale claim is recomputed against the working tree at verify time,
 # so it is NOT the note's redacted copy. Both halves are asserted, so a future
 # edit cannot quietly drop the caveat while keeping the reassuring half.
+#
+# The enumeration widened again at v3: a conjunction's conjunct names and every
+# claim's `reason` joined the redacted set, because a conjunction's reason NAMES a
+# conjunct and a conjunct name is operator-authored. The sentence has to keep
+# enumerating what is actually covered — a list that goes stale in the
+# understating direction is the same defect in a quieter key, and the assertion
+# below is what forces the edit.
 _REMOVED_CLAIM = "secrets are redacted from every export"
 _REPLACEMENT = (
     "Redaction covers the sealed note: every exported claim string — the "
-    "`argv_preview`, the label, the pathspecs and the changed paths — is "
-    "redacted, and the projection is declared in the manifest."
+    "`argv_preview`, the label, the pathspecs, the changed paths, the conjuncts "
+    "and the reason — is redacted, and the projection is declared in the manifest."
 )
 _CAVEAT = (
     "a stale claim's file list is recomputed against your working tree at "

@@ -23,7 +23,7 @@ from .capture import (
     run_wrapped,
     signal_name,
 )
-from .claims import Claim
+from .claims import CLAIM_TYPES, CONJUNCTION, Claim
 from . import manifest as _manifest
 from . import redact
 from . import render
@@ -71,6 +71,19 @@ def cmd_run(args) -> int:
     return event.exit_code if event.exit_code is not None else 0
 
 
+def _conjunct_labels(raw: Optional[str]) -> tuple:
+    """Parse ``--of``: the comma-separated labels of the claims to conjoin.
+
+    Order is the operator's, and it is kept: it decides which of two
+    equally-bad conjuncts the grade's reason names. Surrounding whitespace is
+    stripped and an empty name is dropped rather than matched against a label
+    nothing carries; an empty result reaches ``Claim``, which refuses it.
+    """
+    if not raw:
+        return ()
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 def cmd_claim(args) -> int:
     repo = Path(args.repo or os.getcwd())
     session = _session(repo)
@@ -78,16 +91,46 @@ def cmd_claim(args) -> int:
     if not events:
         print("didrun claim: no recorded events to bind to (run something first)", file=sys.stderr)
         return 2
-    # Default: bind to the most recent successful event.
-    if args.event is not None:
-        indices = (args.event,)
+    conjuncts: tuple = ()
+    indices: tuple = ()
+    if args.type == CONJUNCTION:
+        # A conjunction binds no event — it conjoins claims that carry their own
+        # witnessed events — so the "no successful event to bind" refusal below
+        # is not its refusal. `--event` and `--path` are refused rather than
+        # silently ignored: an operator who passed one meant something by it.
+        if args.event is not None:
+            print(
+                "didrun claim: a conjunction binds no event; name the claims it "
+                "conjoins with --of instead of --event",
+                file=sys.stderr,
+            )
+            return 2
+        if args.path:
+            print(
+                "didrun claim: a conjunction declares no pathspec; its conjuncts "
+                "carry their own",
+                file=sys.stderr,
+            )
+            return 2
+        conjuncts = _conjunct_labels(args.of)
     else:
-        indices = tuple(
-            i for i, ev in enumerate(events) if ev.exit_code == 0
-        )[-1:]  # last success
-    if not indices:
-        print("didrun claim: no successful event to bind (last command did not exit 0)", file=sys.stderr)
-        return 2
+        if args.of:
+            print(
+                f"didrun claim: --of names the claims a conjunction conjoins; "
+                f"{args.type} conjoins none",
+                file=sys.stderr,
+            )
+            return 2
+        # Default: bind to the most recent successful event.
+        if args.event is not None:
+            indices = (args.event,)
+        else:
+            indices = tuple(
+                i for i, ev in enumerate(events) if ev.exit_code == 0
+            )[-1:]  # last success
+        if not indices:
+            print("didrun claim: no successful event to bind (last command did not exit 0)", file=sys.stderr)
+            return 2
     try:
         claim = Claim(
             ctype=args.type,
@@ -95,12 +138,20 @@ def cmd_claim(args) -> int:
             event_indices=indices,
             pathspecs=tuple(args.path or ()),
             declared_at_index=len(events) - 1,
+            conjuncts=conjuncts,
         )
     except Exception as exc:
         print(f"didrun claim: {exc}", file=sys.stderr)
         return 2
     _manifest.declare_claim(session, claim)
-    print(f"declared claim {claim.ctype} ({claim.label}) bound to event(s) {list(indices)}")
+    if claim.conjuncts:
+        print(
+            f"declared claim {claim.ctype} ({claim.label}) over "
+            f"{len(claim.conjuncts)} conjunct(s): {', '.join(claim.conjuncts)} "
+            f"— graded as the worst of them"
+        )
+    else:
+        print(f"declared claim {claim.ctype} ({claim.label}) bound to event(s) {list(indices)}")
     return 0
 
 
@@ -114,6 +165,7 @@ def cmd_seal(args) -> int:
             commitish=args.commit or "HEAD",
             allow_secrets=args.allow_secrets,
             bundle_path=Path(args.bundle) if args.bundle else None,
+            reseal=args.reseal,
         )
     except _manifest.redact.SecretsBlocked as exc:
         print(f"didrun seal: {exc}", file=sys.stderr)
@@ -121,7 +173,13 @@ def cmd_seal(args) -> int:
     except _manifest.ManifestError as exc:
         print(f"didrun seal: {exc}", file=sys.stderr)
         return 2
-    verified = sum(1 for c in m.claims if c["grade"] in ("tree-exact", "scope-exact"))
+    # Counted over the live entries, like the verdict surface: a window whose
+    # earlier attempt was retired would otherwise print "1/2 claims
+    # recorded-exact" for a unit `verify` calls ALL RECORDED-EXACT, and the two
+    # numbers describing the same note have to describe the same set.
+    live = _manifest.live_claims(m.claims)
+    superseded = len(m.claims) - len(live)
+    verified = sum(1 for c in live if c["grade"] in ("tree-exact", "scope-exact"))
     # The tier split is reported even when nothing blocked: "0 findings" and
     # "12 findings, none of them blocking" are different facts about the same
     # green seal, and only one of them is worth a second look.
@@ -130,8 +188,9 @@ def cmd_seal(args) -> int:
     noticed = by_tier.get("notice", 0)
     print(
         f"sealed manifest for {m.commit[:12]} (tree {m.tree[:12]})  "
-        f"{verified}/{len(m.claims)} claims recorded-exact  "
-        f"{blocking + noticed} findings ({blocking} block / {noticed} notice)"
+        f"{verified}/{len(live)} claims recorded-exact  "
+        + (f"{superseded} superseded  " if superseded else "")
+        + f"{blocking + noticed} findings ({blocking} block / {noticed} notice)"
         + ("  [--allow-secrets]" if m.secrets_override else "")
     )
     return 0
@@ -298,16 +357,38 @@ def build_parser() -> argparse.ArgumentParser:
     pr.set_defaults(func=cmd_run)
 
     pc = sub.add_parser("claim", help="declare a structured claim over recorded events")
-    pc.add_argument("type", choices=["command-succeeded", "tests-pass", "lint-clean"])
+    # Read from the vocabulary rather than repeated here. The two lists were
+    # duplicates, and a duplicate of a closed vocabulary drifts silently: the CLI
+    # would keep refusing a type the library had accepted for a release.
+    pc.add_argument("type", choices=list(CLAIM_TYPES))
     pc.add_argument("--label", help="human label (default: the type)")
     pc.add_argument("--event", type=int, help="bind to a specific event index")
     pc.add_argument("--path", action="append", help="declare a pathspec for scope-exact grading")
+    pc.add_argument(
+        "--of",
+        metavar="LABEL[,LABEL…]",
+        help=(
+            "for a conjunction: the comma-separated labels of the claims in this "
+            "seal window it conjoins. The conjunction is graded as the WORST of "
+            "them and can never be better than any one of them; a label that "
+            "names no single live claim in the window grades it unknown"
+        ),
+    )
     pc.set_defaults(func=cmd_claim)
 
     ps = sub.add_parser("seal", help="compile and attach a commit-bound manifest")
     ps.add_argument("--commit", help="commit to bind (default: HEAD)")
     ps.add_argument("--allow-secrets", action="store_true", help="export despite secret findings (redacted; logged)")
     ps.add_argument("--bundle", help="also write an exportable bundle to this path")
+    ps.add_argument(
+        "--reseal",
+        action="store_true",
+        help=(
+            "permit replacing this commit's note with a NARROWER record: the "
+            "claims the replaced note held and this seal does not are then in "
+            "no note at all. Without it, a narrowing re-seal is refused"
+        ),
+    )
     ps.set_defaults(func=cmd_seal)
 
     pv = sub.add_parser("verify", help="verify a commit's claims against recorded evidence")

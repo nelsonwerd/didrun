@@ -91,6 +91,18 @@ def _report(results, all_verified=False, worst="stale", chain="intact",
         def all_verified(self):
             return all_verified
 
+        # Mirrors VerifyReport: a superseded result is record, not verdict, so
+        # both surfaces count the live set and report the retained count
+        # separately. Real GradeResults carry the flag, so the fake derives
+        # these the same way the real report does rather than declaring them.
+        @property
+        def live_results(self):
+            return [r for r in self.results if not r.is_superseded]
+
+        @property
+        def superseded_count(self):
+            return len(self.results) - len(self.live_results)
+
         # Mirrors VerifyReport: both human surfaces report how many verdicts
         # were checked against the recorded entry the seal named.
         @property

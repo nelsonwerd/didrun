@@ -162,10 +162,63 @@ def render_chain_banner(report) -> str:
     return _c(f"x {text}", "31") if text else ""
 
 
+def superseded_text(report) -> str:
+    """One line for the claims a later claim in the same window retired, or "".
+
+    Appended only when it is nonzero, on the `not-recorded` precedent: zero
+    superseded claims is the shape of nearly every window, and a counter on
+    every verify would be boilerplate about a case that did not occur.
+
+    What it says is the honest bound of the mechanism. Retrying a gate until it
+    passes is not prevented — it is RETAINED and counted here, which is strictly
+    better than the invisible truncation it replaces.
+    """
+    count = report.superseded_count
+    if not count:
+        return ""
+    return (
+        f"{count} claim{'' if count == 1 else 's'} superseded within this seal "
+        f"window (retained in the record, excluded from the verdict)"
+    )
+
+
+def _conjunct_token(grade) -> str:
+    """The token for one conjunct of a conjunction — never a grade for a name
+    that resolved to nothing.
+
+    ``None`` means the label matched no single live claim in the seal window.
+    That is not a grade, and rendering it through ``_GRADE_DISPLAY`` would print
+    it as UNKNOWN — a real grade, and a claim the note never made. The
+    conjunction itself already grades unknown in that case; this row says which
+    member is the reason.
+    """
+    if grade is None:
+        return "UNRESOLVED"
+    return _GRADE_DISPLAY.get(grade, ("UNKNOWN", "33", "?", ""))[0]
+
+
+def _row_detail(r, reason: str) -> str:
+    """The detail cell text, prefixed when the row is record rather than verdict.
+
+    Without this a retired FAILED row still reads FAILED under an ALL
+    RECORDED-EXACT headline, which looks like the tool contradicting itself. The
+    grade and reason are NOT rewritten — that is the whole point of keeping the
+    entry — so the marker goes in front of them.
+    """
+    if not r.is_superseded:
+        return reason
+    return f"superseded by claim #{r.superseded_by} (record, not verdict) — {reason}"
+
+
 def render_verdict(report, width: int = 80) -> str:
     """Render a VerifyReport as the CLI instrument panel."""
     lines: list[str] = []
-    results = sorted(report.results, key=lambda r: _SORT_RANK.get(r.grade, 9))
+    # Retired rows sort BELOW every live one, whatever they graded: they are the
+    # record of how the unit got here, and the live claims are what a reviewer
+    # is being asked about.
+    results = sorted(
+        report.results, key=lambda r: (r.is_superseded, _SORT_RANK.get(r.grade, 9))
+    )
     banner = render_chain_banner(report)
 
     worst = report.worst_status if report.results else "empty"
@@ -181,8 +234,12 @@ def render_verdict(report, width: int = 80) -> str:
         return "\n".join(lines)
 
     token, color, marker, _gloss = _GRADE_DISPLAY.get(worst, ("UNKNOWN", "33", "?", ""))
-    verified = sum(1 for r in report.results if r.grade in ("tree-exact", "scope-exact"))
-    total = len(report.results)
+    # Counted over the LIVE set, which is the set the verdict was computed over.
+    # Counting retired claims here would print "1/2 recorded-exact" under an ALL
+    # RECORDED-EXACT headline; the retained count gets its own line instead.
+    live = report.live_results
+    verified = sum(1 for r in live if r.grade in ("tree-exact", "scope-exact"))
+    total = len(live)
 
     # Verdict header — the one line a reviewer reads first. The marker prefix
     # carries severity even with color stripped.
@@ -198,6 +255,9 @@ def render_verdict(report, width: int = 80) -> str:
     # How many of those verdicts were checked against the recorded entry the
     # seal named, rather than regraded against whatever ledger is on disk now.
     lines.append(f"  {report.evidence_bound_count}/{total} claims evidence-bound")
+    superseded = superseded_text(report)
+    if superseded:
+        lines.append(f"  {superseded}")
     lines.append(f"  {env_summary_text(report)}")
     if report.secrets_override:
         lines.append(_c("  ! sealed with --allow-secrets (redacted export)", "33"))
@@ -211,7 +271,7 @@ def render_verdict(report, width: int = 80) -> str:
     for r in results:
         token, color, marker, gloss = _GRADE_DISPLAY.get(r.grade, ("UNKNOWN", "33", "?", ""))
         label = _sanitize(r.claim.label)[:26]
-        detail = _sanitize(r.reason)
+        detail = _row_detail(r, _sanitize(r.reason))
         if r.exit_code is not None:
             detail = f"exit {r.exit_code}  {detail}"
         lines.append(f"  {marker} {_c(f'{token:<12}', color)} {label:<26} {detail}")
@@ -222,6 +282,14 @@ def render_verdict(report, width: int = 80) -> str:
         if r.env_status == ENV_DRIFT:
             lines.append(
                 f"    {'':<12} {'':<26}   {ENV_DRIFT}: {_sanitize(r.env_reason)}"
+            )
+        # A conjunction's members, each with what it earned. Uncapped on
+        # purpose: the row's grade IS one of these, and hiding the tail would
+        # hide the conjunct the verdict came from.
+        for label, cgrade in r.conjunct_grades:
+            lines.append(
+                f"    {'':<12} {'':<26}   of {_sanitize(label)}: "
+                f"{_conjunct_token(cgrade)}"
             )
         # Drill-down: show the delta for stale/scope, capped.
         for change in r.delta[:5]:
@@ -243,9 +311,12 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     CSP; 100% of dynamic content HTML-escaped; failing/stale first; responsive;
     print-clean. This is the shareable evidence surface.
     """
-    results = sorted(report.results, key=lambda r: _SORT_RANK.get(r.grade, 9))
-    verified = sum(1 for r in report.results if r.grade in ("tree-exact", "scope-exact"))
-    total = len(report.results)
+    results = sorted(
+        report.results, key=lambda r: (r.is_superseded, _SORT_RANK.get(r.grade, 9))
+    )
+    live = report.live_results
+    verified = sum(1 for r in live if r.grade in ("tree-exact", "scope-exact"))
+    total = len(live)
     worst = report.worst_status if report.results else "empty"
     all_ok = report.all_verified
 
@@ -256,9 +327,24 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     for r in results:
         token, _color, _marker, _gloss = _GRADE_DISPLAY.get(r.grade, ("UNKNOWN", "", "?", ""))
         grade_class = r.grade.replace("-", "_")
-        detail = esc(r.reason)
+        if r.is_superseded:
+            # A second class, not a replaced one: the row keeps the grade it
+            # earned (that is the record) and the tone says it does not vote.
+            grade_class += " superseded"
+        detail = _row_detail(r, esc(r.reason))
         exit_txt = f"exit {r.exit_code}" if r.exit_code is not None else "—"
         argv = " ".join(r.claim.get("argv_preview", [])) if isinstance(r.claim, dict) else ""
+        # The conjunct list rides in the detail column, above the delta: a
+        # conjunction's grade is one of these, so it is the first thing a reader
+        # of that row needs. Same list markup as the delta — a conjunction
+        # carries an existing grade, so no new badge or token is introduced.
+        conjunct_html = ""
+        if r.conjunct_grades:
+            items = "".join(
+                f"<li><span class='ch'>{esc(_conjunct_token(g))}</span> {esc(label)}</li>"
+                for label, g in r.conjunct_grades
+            )
+            conjunct_html = f"<ul class='delta conjuncts'>{items}</ul>"
         delta_html = ""
         if r.delta:
             items = "".join(
@@ -280,7 +366,8 @@ def render_html(report, title: str = "didrun evidence report") -> str:
             f"<td class='status'><span class='badge {grade_class}'>{esc(token)}</span></td>"
             f"<td class='claim'>{esc(claim_label)}</td>"
             f"<td class='detail'><span class='reason'>{detail}</span>"
-            f"<span class='exit'>{esc(exit_txt)}</span>{env_html}{delta_html}</td>"
+            f"<span class='exit'>{esc(exit_txt)}</span>{env_html}"
+            f"{conjunct_html}{delta_html}</td>"
             f"</tr>"
         )
 
@@ -291,6 +378,8 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     chain_html = (
         f'<div class="chainbanner">{esc(chain_text)}</div>' if chain_text else ""
     )
+    superseded = superseded_text(report)
+    superseded_html = f"{esc(superseded)} ·" if superseded else ""
 
     if all_ok:
         verdict_class, verdict_text = "ok", "ALL RECORDED-EXACT"
@@ -377,6 +466,11 @@ def render_html(report, title: str = "didrun evidence report") -> str:
   tr.stale td, tr.unknown td, tr.witness_unavailable td {{
     background:color-mix(in srgb, var(--warn) 10%, transparent); }}
   tr.failed td {{ background:color-mix(in srgb, var(--bad) 12%, transparent); }}
+  /* A retired row is record, not verdict: toned down and stripped of its accent
+     bar so it cannot be read as a live problem. Dimmed, never hidden — the
+     whole point of supersession is that the earlier attempt stays visible. */
+  tr.superseded td {{ opacity:.62; }}
+  tr.superseded td.status {{ box-shadow:none; }}
   tr.failed td.status {{ box-shadow:inset 3px 0 0 var(--bad); }}
   tr.stale td.status {{ box-shadow:inset 3px 0 0 var(--warn); }}
   tr.unknown td.status {{ box-shadow:inset 3px 0 0 var(--warn); }}
@@ -413,6 +507,7 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     {chain_html}
     <div class="meta">{esc(verified)}/{esc(total)} claims recorded-exact ·
       {esc(report.evidence_bound_count)}/{esc(total)} claims evidence-bound ·
+      {superseded_html}
       {esc(env_summary_text(report))} ·
       commit {esc(report.commit[:12])} · tree {esc(report.tree[:12])} ·
       resolved-by {esc(report.resolved_by)} · coverage {coverage_html}</div>

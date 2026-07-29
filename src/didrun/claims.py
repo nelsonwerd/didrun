@@ -15,6 +15,24 @@ wins:
 instrumentation in disguise with no deterministic v1 implementation; it is
 killed by design (coverage belongs in an adapter, not the core). Registering it
 raises with the flip condition.
+
+``conjunction`` is the one claim type that grades no evidence of its own. It
+names other claims in the same seal window by label and is graded as the WORST
+of them, so it can never be better than any one of its members. The property it
+represents — "all N of these gates passed against this tree" — had no
+representation in the tool and was being enforced by hand.
+
+**The distinction this type is on the right side of, stated because the next
+reader will conflate the two.** A design review of an 80-command proof ledger
+declined a proposal to replace some of those recorded executions with a
+transition marker, and the reason is quoted here rather than softened: a marker
+witnesses *that a transition occurred*, not *that the command ran and exited
+0*, so substituting one for the other genuinely weakens the claim. That refusal
+stands, permanently, and nothing here attempts it — a conjunction substitutes
+for nothing. Every conjunct keeps its own witnessed exit code and its own tree
+comparison, graded by the same ladder as any other claim, and the conjunction
+asserts nothing its members do not already back. It conjoins execution witnesses
+that exist; it never reconstitutes one that does not.
 """
 
 from __future__ import annotations
@@ -26,9 +44,16 @@ from typing import Optional
 from .ledger import Event, Session
 from . import gitplumbing
 
-# The v1 claim vocabulary. `tests-pass` and `lint-clean` are labels over one
+# The claim vocabulary. `tests-pass` and `lint-clean` are labels over one
 # generic engine: "a declared command exited 0". No claim type infers meaning.
-CLAIM_TYPES = ("command-succeeded", "tests-pass", "lint-clean")
+#
+# `conjunction` is the one entry that binds no event of its own: it names other
+# claims in the same seal window and is graded as the worst of them. Extending
+# this tuple is a MANIFEST_VERSION bump (docs/COMPAT.md) — an older reader hits
+# `unknown claim type` on a note that carries a type it has never seen.
+CONJUNCTION = "conjunction"
+
+CLAIM_TYPES = ("command-succeeded", "tests-pass", "lint-clean", CONJUNCTION)
 
 KILLED_CLAIM_TYPES = {
     "diff-exercised": (
@@ -69,6 +94,45 @@ ENV_DRIFT = "env-drift-since-seal"
 ENV_INCOMPARABLE = "incomparable"
 ENV_NOT_RECORDED = "not-recorded"
 
+# Worst first. This is the ONE severity order in the package: the whole-report
+# verdict (manifest.VerifyReport.worst_status) reads it, and a conjunction reads
+# it to grade as the worst of its conjuncts. Two copies could disagree about
+# which grade is worse, and a conjunction that disagreed with the verdict line
+# above it would be the exact overclaim this type has to be incapable of.
+#
+# `chain-broken` is deliberately absent: it is a statement about the ledger every
+# grade was read out of, not a grade any claim can carry, and it dominates the
+# verdict before this order is consulted.
+GRADE_ORDER_WORST_FIRST = (
+    GRADE_FAILED,
+    GRADE_UNKNOWN,
+    GRADE_WITNESS_UNAVAILABLE,
+    GRADE_STALE,
+    GRADE_SCOPE_EXACT,
+    GRADE_TREE_EXACT,
+)
+
+
+def worst_grade(grades) -> Optional[str]:
+    """The worst grade in ``grades`` under ``GRADE_ORDER_WORST_FIRST``.
+
+    Ties go to the first occurrence, so the caller's order decides which of two
+    equally-bad members is named — never the iteration order of a set.
+
+    A grade this version does not know ranks WORSE than every registered one. A
+    grade nobody here can interpret is not evidence that anything is fine, and
+    ranking it best is how an unregistered token would carry a conjunction to
+    green. Returns None for an empty input; callers must not treat that as a
+    grade.
+    """
+    worst: Optional[str] = None
+    worst_rank: Optional[int] = None
+    for g in grades:
+        rank = GRADE_ORDER_WORST_FIRST.index(g) if g in GRADE_ORDER_WORST_FIRST else -1
+        if worst_rank is None or rank < worst_rank:
+            worst, worst_rank = g, rank
+    return worst
+
 
 class ClaimError(Exception):
     """A claim declaration violated an invariant."""
@@ -81,6 +145,13 @@ class Claim:
     ``pathspecs`` are supplied by the claimant for a scope-exact grade; they are
     never auto-derived. ``declared_at_index`` is the session index at which the
     claim was declared — used for the retroactive-binding rule.
+
+    ``conjuncts`` are the LABELS of other claims in the same seal window that a
+    ``conjunction`` conjoins. They are labels rather than event indices on
+    purpose: a conjunction must not be a claim bound to several events. That
+    shape already exists, grades on the first bound success it finds, and is the
+    illegitimate composite the design review ruled out — so ``event_indices`` is
+    required to be EMPTY here and its meaning is untouched.
     """
 
     ctype: str
@@ -88,12 +159,30 @@ class Claim:
     event_indices: tuple[int, ...]
     pathspecs: tuple[str, ...] = ()
     declared_at_index: int = -1
+    conjuncts: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.ctype in KILLED_CLAIM_TYPES:
             raise ClaimError(KILLED_CLAIM_TYPES[self.ctype])
         if self.ctype not in CLAIM_TYPES:
             raise ClaimError(f"unknown claim type: {self.ctype!r}")
+        if self.ctype == CONJUNCTION:
+            if not self.conjuncts:
+                raise ClaimError(
+                    "a conjunction claim must name the claims it conjoins "
+                    "(at least one conjunct label)"
+                )
+            if self.event_indices:
+                raise ClaimError(
+                    "a conjunction claim binds no event: it conjoins claims that "
+                    "carry their own witnessed events, and widening its bound "
+                    "events would make it a multi-index claim instead"
+                )
+        elif self.conjuncts:
+            raise ClaimError(
+                f"claim type {self.ctype!r} names no conjuncts; only a "
+                f"conjunction claim conjoins other claims"
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -102,6 +191,11 @@ class Claim:
             "event_indices": list(self.event_indices),
             "pathspecs": list(self.pathspecs),
             "declared_at_index": self.declared_at_index,
+            # Emitted always, like `pathspecs`, and read with a default below:
+            # an older reader that does not know the key sees the claim it
+            # always saw, and every claim this version writes declares the key
+            # whether or not it carries one.
+            "conjuncts": list(self.conjuncts),
         }
 
     @classmethod
@@ -112,6 +206,7 @@ class Claim:
             event_indices=tuple(d.get("event_indices", ())),
             pathspecs=tuple(d.get("pathspecs", ())),
             declared_at_index=d.get("declared_at_index", -1),
+            conjuncts=tuple(d.get("conjuncts", ())),
         )
 
 
@@ -128,6 +223,21 @@ class GradeResult:
     are deliberately NOT in ``to_dict``: the seal has nothing to compare against
     itself, so writing them would put a permanently-default key in every
     published note.
+
+    ``superseded_by`` is verify-side for a different reason: supersession is a
+    fact about the seal WINDOW, not about this claim's evidence, so the seal
+    writes the mark onto the exported entry itself (manifest._redact_result) and
+    verify reads it back onto the result. Keeping it out of ``to_dict`` is what
+    makes the mark appear only on the entries that carry one, instead of putting
+    a permanently-null key on every claim in every note.
+
+    ``conjunct_grades`` holds one ``(label, grade)`` pair per conjunct a
+    conjunction declared, in declaration order, so the note carries what each
+    member earned instead of only the worst of them. ``grade`` is None for a
+    conjunct that resolved to no single live claim: an unresolved name has no
+    grade, and giving it one would be the invented fact this whole type exists
+    not to produce. Serialized only when non-empty, on ``superseded_by``'s
+    precedent — every other claim would otherwise carry an empty list forever.
     """
 
     claim: Claim
@@ -140,9 +250,21 @@ class GradeResult:
     sealed_grade: Optional[str] = None
     env_status: str = ENV_NOT_RECORDED
     env_reason: str = ""
+    superseded_by: Optional[int] = None
+    conjunct_grades: tuple = ()
+
+    @property
+    def is_superseded(self) -> bool:
+        """Whether a later claim in the same seal window retired this one.
+
+        A superseded result is RECORD, not verdict: its grade and reason are
+        kept verbatim and stay visible, and it is excluded from the verdict —
+        never relabelled, re-graded or dropped.
+        """
+        return self.superseded_by is not None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "claim": self.claim.to_dict(),
             "grade": self.grade,
             "reason": self.reason,
@@ -152,6 +274,11 @@ class GradeResult:
             "evidence_bound": self.evidence_bound,
             "sealed_grade": self.sealed_grade,
         }
+        if self.conjunct_grades:
+            d["conjunct_grades"] = [
+                {"label": label, "grade": g} for label, g in self.conjunct_grades
+            ]
+        return d
 
 
 def _supporting_event(claim: Claim, events: list[Event]) -> Optional[tuple[int, Event]]:
@@ -184,18 +311,87 @@ def _witnessed_failure(claim: Claim, events: list[Event]) -> Optional[tuple[int,
     return None
 
 
+def grade_conjunction(claim: Claim, siblings: Optional[list] = None) -> GradeResult:
+    """Grade a conjunction as the WORST of the claims it names. Never better.
+
+    ``siblings`` are the other graded results of the same seal window. Two kinds
+    are filtered out here rather than at the call site, so both callers (seal and
+    verify) get the same resolution from the same rule:
+
+    - **superseded entries.** A repair re-declares the same gate, so the retired
+      attempt shares its label with the claim that stands in its place. Skipping
+      it is what lets a conjunction name a gate that failed and was fixed inside
+      the window; counting it would make every such name ambiguous.
+    - **other conjunctions.** A conjunction naming a conjunction resolves to no
+      match and grades ``unknown``. That is deliberate: it keeps resolution one
+      level deep, so there is no recursion to bound and no cycle to detect, and
+      the grade of a name this function will not follow is not asserted.
+
+    Resolution is by EXACT label match — never a prefix, never a fuzzy one. A
+    name matching no live claim, or more than one, makes the whole conjunction
+    ``unknown`` and the reason names it: a member it cannot identify is a member
+    it cannot vouch for, and grading around the gap is how a conjunction would
+    come out better than its parts.
+    """
+    pool = [
+        s
+        for s in (siblings or ())
+        if not s.is_superseded and s.claim.ctype != CONJUNCTION
+    ]
+    pairs: list = []
+    unresolved: list[str] = []
+    for name in claim.conjuncts:
+        matches = [s for s in pool if s.claim.label == name]
+        if len(matches) == 1:
+            pairs.append((name, matches[0].grade))
+            continue
+        pairs.append((name, None))
+        unresolved.append(
+            f"{name!r} names no claim in this seal window"
+            if not matches
+            else f"{name!r} names {len(matches)} claims in this seal window"
+        )
+    if unresolved:
+        return GradeResult(
+            claim,
+            GRADE_UNKNOWN,
+            reason="unresolved conjunct: " + "; ".join(unresolved),
+            conjunct_grades=tuple(pairs),
+        )
+    worst = worst_grade(g for _name, g in pairs)
+    # Ties go to the first declared conjunct, which is what makes this reason
+    # reproducible for the same window rather than a function of dict ordering.
+    named = next(name for name, g in pairs if g == worst)
+    return GradeResult(
+        claim,
+        worst,
+        reason=f"worst of {len(pairs)} conjunct(s): {named!r} graded {worst}",
+        conjunct_grades=tuple(pairs),
+    )
+
+
 def grade(
     claim: Claim,
     sealed_tree: str,
     events: list[Event],
     repo: Path,
     ledger_objects: Optional[Path] = None,
+    siblings: Optional[list] = None,
 ) -> GradeResult:
     """Grade one claim against ``sealed_tree``. First match wins.
 
     The ordering is the honesty ladder: only concede a weaker grade when the
     stronger one cannot be honestly asserted.
+
+    ``siblings`` is consulted for a ``conjunction`` and for nothing else: it
+    grades no evidence of its own, so it is dispatched BEFORE the ladder rather
+    than added as a rung. Every rung below is untouched, and a caller that
+    forgets ``siblings`` gets a conjunction graded ``unknown`` — the fail-closed
+    direction, never a green one.
     """
+    if claim.ctype == CONJUNCTION:
+        return grade_conjunction(claim, siblings)
+
     # A witnessed failure among the bound events DOMINATES a witnessed success.
     # Consulting _supporting_event first graded a claim bound to
     # [failed, success] on the success and made the caught lie invisible.

@@ -29,7 +29,19 @@ _REAL_RUN = subprocess.run
 # Additive fields land here as a DELIBERATE one-line diff, never silently.
 # v2 adds no TOP-LEVEL key: the evidence binding lives inside each claim entry,
 # so the manifest's own key set is unchanged from v1.
-_ADDITIVE_KEYS_BY_MANIFEST_VERSION = {1: frozenset(), 2: frozenset()}
+# `claims_from`/`claims_to` are P4.1's: the claim window the seal covered. Both
+# are additive with a reading default (0 / len(claims)), so a stored note of
+# EITHER version legitimately lacks them, and both rows carry them.
+# v3 is P4.2's `conjunction` claim type, which adds no top-level key either: the
+# conjunct list and the per-conjunct grades live inside a claim entry. The row
+# exists so the version this build writes has a DECLARED allowlist instead of a
+# KeyError, and so a v3-only top-level field would still have to land here on
+# purpose.
+_ADDITIVE_KEYS_BY_MANIFEST_VERSION = {
+    1: frozenset({"claims_from", "claims_to"}),
+    2: frozenset({"claims_from", "claims_to"}),
+    3: frozenset({"claims_from", "claims_to"}),
+}
 
 
 def _session(repo: Path) -> Session:
@@ -109,10 +121,18 @@ def _round_trip(body: bytes) -> M.Manifest:
     for key, value in source.items():
         assert key in emitted, f"round-trip dropped manifest key {key!r}"
         assert emitted[key] == value, f"round-trip changed manifest key {key!r}"
+    # The allowlist is the BOUND on what may be missing, not an exact set: every
+    # body this helper sees was written by the seal under test, so it already
+    # carries every key `to_json` emits and the extra set is empty. Exact
+    # equality here asserted that a note this binary just published must LACK a
+    # key it declares, which stopped being true the moment an additive field
+    # landed. The leg that actually exercises a key-lacking note is
+    # tests/compat's leg 2 (over stored v1 bodies), plus the byte pin below.
     extra = frozenset(emitted) - frozenset(source)
-    assert extra == _ADDITIVE_KEYS_BY_MANIFEST_VERSION[source["version"]], (
-        f"unexpected extra manifest keys {sorted(extra)} — a field was added "
-        "without updating the per-version allowlist"
+    allowed = _ADDITIVE_KEYS_BY_MANIFEST_VERSION[source["version"]]
+    assert extra <= allowed, (
+        f"unexpected extra manifest keys {sorted(extra - allowed)} — a field was "
+        "added without updating the per-version allowlist"
     )
 
     # (c) serialization is idempotent; this is where canonical_json is pinned.
@@ -179,8 +199,12 @@ def test_watermark_failure_restores_a_prior_note(repo: Path, monkeypatch):
 
     monkeypatch.setattr(M, "_record_seal", boom)
 
+    # `reseal=True` because the prior note here is deliberately NOT a didrun
+    # manifest, so it records no claim window and P4.1 refuses to replace it
+    # blind. This test's subject is the rollback restoring the overwritten body
+    # byte-for-byte, which needs the seal to reach `_record_seal` at all.
     with pytest.raises(M.ManifestError) as exc:
-        M.seal(s, repo)
+        M.seal(s, repo, reseal=True)
 
     message = str(exc.value)
     assert "no watermark was recorded" in message
@@ -266,6 +290,10 @@ def test_manifest_json_bytes_are_pinned():
     is additive with a v1-reproducing default — which is why this is a one-line
     diff here plus a one-line diff in the compat allowlist, and not a
     MANIFEST_VERSION bump.
+
+    P4.1 adds `claims_from`/`claims_to`, the claim window the seal covered, on
+    the same terms: reading defaults of 0 and `len(claims)`, so no stored note
+    changes meaning and this stays a deliberate diff rather than a version bump.
     """
     m = M.Manifest(
         version=1,
@@ -295,6 +323,7 @@ def test_manifest_json_bytes_are_pinned():
         b'"declared_at_index":0,"event_indices":[0],"label":"t","pathspecs":[]},'
         b'"delta":[],"exit_code":0,"grade":"tree-exact","reason":"r",'
         b'"supporting_event_index":0}],'
+        b'"claims_from":0,"claims_to":1,'
         b'"commit":"0000000000000000000000000000000000000000",'
         b'"coverage":{"by_coverage":{"complete":1},"total_events":1},'
         b'"secrets":{},"secrets_override":false,'
