@@ -100,6 +100,19 @@ notes (**884** graded claims, **22,062** exported argv elements, **602,975**
 characters of exported argv), read through `git notes list` + `git cat-file`
 only. Counts, never tokens.
 
+**These counts do not agree with the other corpus figures in this repository, and
+nothing here reconciles them.** `docs/V02_STATUS.md` and `docs/COMPAT_REPLAY.md`
+cite **65** notes and **846** claims from the research pack; `docs/COMPAT.md` cites
+**167** archived ledgers where those two cite **178**; and the 846 figure is itself
+already contradicted by a 667 elsewhere in the same research. A live corpus measured
+on different days would explain some of the gap and is not established for any of it.
+The discrepancy is an open item (FU1 / B5), it is settled only by a recount over a
+corpus copy, and until that runs every corpus number in these docs should be read as
+*one measurement, on one day, self-reported by the system under study* — not as a
+single consistent census. What the table below rests on is the **relative** result
+(which detector fired, and how often), which is internally consistent within this one
+2026-07-29 read.
+
 **What the detectors actually caught, in production:**
 
 | Detector | Redaction markers in the 66 exported notes |

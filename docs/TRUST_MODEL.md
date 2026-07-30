@@ -34,6 +34,14 @@ ran it or whether it mattered.**
 | `scope-exact` | Every change since the evidence is inside claimant-declared pathspecs. | That the declared pathspecs are the *right* scope — the claimant chose them. |
 | `stale` | Evidence exists; here is the exact delta between it and the sealed tree. | Nothing beyond "the tree moved" — the reviewer judges whether the delta matters. |
 | `unknown` | We could not honestly bind evidence to this claim. | That the claim is false — only that it is unbacked. |
+| `failed` | The command backing this claim was *recorded exiting nonzero* — evidence against the claim, not merely absent evidence. | Anything about intent. A recorded failure is a fact about a process's exit code, never a statement about who ran it or why. |
+| `witness-unavailable` | The note bound this claim to a recorded entry the live ledger cannot supply; the sealed grade is shown as history. | That anyone tampered. An archived, rebuilt or replaced ledger produces this too. It is never re-earned, and `--strict` never accepts it. |
+| `chain-broken` | Report-level, never a per-claim row: the ledger every grade was read out of does not recompute, or this binary cannot check it. | Which of accident or tampering caused it. The chain is regenerable, so a break is evidence of *mutation*, never of *who* mutated. |
+
+The first five are the ladder, evaluated worst-first — `failed`, `unknown`, `stale`,
+`scope-exact`, `tree-exact` — and the first match wins, so a claim never grades better
+than the weakest fact about it. The last two are not rungs: one replaces a grade when
+the evidence behind it cannot be produced, the other overrides the whole report.
 
 ## What it protects against, by actor
 
@@ -41,8 +49,8 @@ ran it or whether it mattered.**
 |-------|--------------------------|----------------------|
 | **Lazy agent** (claims without running) | The claim grades `unknown` — no witnessed success. | — |
 | **Agent that runs, then edits** | The claim grades `stale` with the exact delta. | — |
-| **Honest mistake** (partial/truncated ledger) | The hash chain breaks; `show --session` reports it. | — |
-| **Developer massaging their own receipts** | Accidental edits break the chain. | A deliberate local rebuild of the chain — it is regenerable. |
+| **Honest mistake** (partial/truncated ledger) | The hash chain breaks. From v0.2 `verify` checks it *before* grading anything and the fault dominates the verdict, so `--strict` refuses; `show --session` reports it too. | A fault in a ledger `seal` is writing to — `seal` does not consult the chain, so sealing over a broken one is possible. |
+| **Developer massaging their own receipts** | Accidental edits break the chain. From v0.2, a note whose bound entry the live ledger cannot supply grades `witness-unavailable` and `--strict` refuses it, so a substituted or rebuilt ledger no longer regrades green. | A deliberate local rebuild of the chain — it is regenerable, and `claim` + `seal` can then mint fresh hash-bound claims. |
 | **Stranger sending forged evidence** | — | Everything. Unsigned local evidence is self-attested; do not trust a stranger's ledger. Cross-party trust needs signing (deferred). |
 
 ## Why signing is deferred (and it is a bet)

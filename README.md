@@ -8,11 +8,12 @@
 **Flight records for agent-written code.**
 
 > **v0.2 · experimental.** The six commands (`run`, `claim`, `authorize`, `seal`,
-> `verify`, `show`) work, and the test suite and capture kill-gate are green — on one
-> machine, macOS / CPython 3.14. The declared floor is **Python 3.11**: the CI matrix
-> (ubuntu + macOS × 3.11–3.13) is wired to `main`, which is what the badge above tracks,
-> and it has **never run on the v0.2 branch**. Read "3.11+" as declared and tested on
-> `main`, not as a v0.2 measurement. The API and CLI may still change, and there has been
+> `verify`, `show`) work, and the test suite and capture kill-gate are green on the full
+> CI matrix — ubuntu + macOS × Python 3.11 / 3.12 / 3.13, which is what the badge above
+> tracks. The declared floor of **3.11** is now executed rather than only declared. Read
+> that as "the suite runs there", not as a v0.2 measurement: every *number* in these docs
+> is still one machine, macOS / CPython 3.14, because CI runs the suite and does not
+> reproduce the benchmarks. The API and CLI may still change, and there has been
 > no independent security review. **Upgrading from v0.1? Verifiers before sealers** — see
 > [What changed in v0.2](#what-changed-in-v02). What didrun does and does not attest is
 > [here](docs/TRUST_MODEL.md); the unflattering version of what this release did and did
@@ -200,7 +201,7 @@ outright rather than being ignored. The rest:
 **What v0.2 did not establish.** Compatibility with evidence already sealed is **not** a
 finding: the compat harness is content-blind and green on synthetic fixtures only, the
 real archive replay has never run, and the harness prints `corpus: SKIPPED (unverified)`
-rather than let a green line imply otherwise. Nor has CI run on this branch. And two
+rather than let a green line imply otherwise. And two
 operational errors still escape as Python tracebacks with exit **1** instead of the graded
 refusal with exit 2 that the same binary gives elsewhere: a command that does not exist,
 and a `session.log` this binary cannot parse (which takes `run`, `verify` and

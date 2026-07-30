@@ -81,6 +81,26 @@ it exits 0. Never present un-wrapped commands as verified.
 
 ---
 
+## Two v0.2 behaviours the loop depends on
+
+Both are what make "fix, re-claim, re-seal, re-verify until it exits 0" actually
+converge, and an agent that doesn't know about them will read the first as a bug.
+
+- **`claim` refuses to bind past a failure.** With no `--event`, a claim binds the
+  command that just ran, and it **exits 2** rather than reach back for an earlier
+  passing event when the latest one exited nonzero. So the loop cannot be closed by
+  running the gate again after a failure and claiming the older green — the fix has to
+  come first. A refused claim writes nothing.
+- **Re-declaring the same type *and* label supersedes the earlier claim.** The retired
+  one keeps its grade in the record, drops out of the verdict, and is counted on both
+  surfaces. This is why a fix-verify loop converges instead of accumulating red rows —
+  but it is keyed on `(type, label)`, so an agent that varies the label each pass gets
+  a growing pile of stale claims rather than one that supersedes.
+
+Note the shape of what this buys: repeatedly claiming a gate until one attempt goes
+green is not *prevented*. Every attempt stays in the note and the retired count is
+printed, so it is visible. Visible, not blocked, is the honest bound.
+
 ## The honest bounds (read this — it's the whole point)
 
 Cooperative capture works because the agent *complies with an instruction*, not
@@ -93,6 +113,12 @@ because the system intercepts commands no matter what. So:
 - **Absence of a receipt is ambiguous** under this model — it can mean "nothing ran"
   or "the agent didn't route it through didrun." Read `didrun show --session` to see
   what was actually captured.
+- **`authorize` is not an approval channel.** If a workflow reaches for
+  `didrun authorize` to get past `--allow-secrets` or `--reseal`, understand what it
+  records: that a file with a given SHA-256 was cited. An agent can write its own
+  authorization artifact in one line, and every surface that prints one says so. It is
+  not a signature, not authentication, and not evidence a human approved anything —
+  see [TRUST_MODEL.md](TRUST_MODEL.md).
 - **This is not enforcement.** A tool that *guarantees* capture regardless of agent
   cooperation is what didrun's Tier 1–3 (PATH shim / shell trap / native adapter)
   are for; those are not yet exposed as a turnkey command. Cooperative Tier 0 is the

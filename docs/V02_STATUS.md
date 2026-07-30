@@ -1,5 +1,27 @@
 # didrun v0.2 — release readiness, stated honestly
 
+> **Addendum, 2026-07-30 — what cleared after this was written.** Everything below this
+> block is a frozen snapshot of `49a8b74` and is left exactly as it stood that day; this
+> block is the only part written later, because rewriting the body would make the
+> snapshot misreport what was known on 2026-07-29.
+>
+> - **Gate 2 (CI) is CLEARED.** The full matrix — ubuntu + macOS × Python 3.11 / 3.12 /
+>   3.13, running both `python -m pytest` and `python -m harness.recall` — is green on
+>   `main` at `bc03d04`
+>   ([run 30567649462](https://github.com/nelsonwerd/didrun/actions/runs/30567649462)).
+>   The declared 3.11 floor has now executed; "nothing has ever run there" is no longer
+>   true. What CI does **not** do is reproduce any number in `docs/MEASUREMENTS.md` —
+>   those are still one machine, macOS / CPython 3.14. It runs the suite, not the
+>   benchmarks.
+> - **K3 is done and v0.2 is merged.** `didrun --version` reports `0.2.0`, and
+>   `v0.2-hardening` landed on `main` via
+>   [PR #1](https://github.com/nelsonwerd/didrun/pull/1).
+> - **Gates 1, 3 and 4 are still NOT CLEARED**, unchanged: the real-corpus replay, the
+>   S6 live-agent recall leg, and the adversarial-agent experiment have none of them run.
+>   K1, K2 and K4 are still open.
+> - The **30 of 44** count in *The honest summary* is as of 2026-07-29 and is **not**
+>   restated here; Gate 2's clearing is not folded into it.
+
 **As of 2026-07-29, commit `49a8b74` on `v0.2-hardening`.** Nineteen units landed across six phases. This
 document exists because the difference between *"we shipped the code"* and *"we know it works"* is the only
 thing a trust tool actually sells, and the two are not the same size here.

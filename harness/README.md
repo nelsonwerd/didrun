@@ -52,6 +52,12 @@ capture validation.
 - **Linux digest rerun.** All timing/capability numbers are macOS/APFS/arm64.
   Run `python -c "from didrun.gitplumbing import capability_probe; capability_probe()"`
   and `harness`'s digest benchmark on Linux/ext4 before the envelope is normative.
-- **First-real-session secrets scan.** Run a real captured session through
-  `didrun seal` and confirm the redaction blocker fires (or doesn't) on real
-  output — the scanner is a safety net, not a guarantee.
+  From 0.2.0 CI runs the *suite* and this gate on ubuntu, which says the code works
+  there; it does not reproduce a single number in `docs/MEASUREMENTS.md`.
+- **First-real-session secrets scan.** Partly answered, still open. The detector
+  tables in `docs/MEASUREMENTS.md` were measured over **exported `argv_preview`
+  strings** from real sealed notes — never over the recorded output blobs in the
+  ledgers, which is where a captured secret actually lands (tracked as FU2 / B6 in
+  `docs/COMPAT_REPLAY.md`). Run a real captured session through `didrun seal` and
+  confirm the redaction blocker fires (or doesn't) on real *output* — the scanner is
+  a safety net, not a guarantee.

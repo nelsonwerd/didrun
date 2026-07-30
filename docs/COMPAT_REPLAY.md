@@ -1,5 +1,18 @@
 # The v0.2 compat replay — verified, bet, and known not closed
 
+> **Addendum, 2026-07-30 — one bet settled.** The replay below is a frozen record of what
+> ran on 2026-07-29 and is left byte-for-byte as it was; this block is the only later
+> writing. **B12 (CI green on 3.11 / 3.12 / 3.13 × ubuntu / macos) is now settled, and
+> gate 2 is CLEARED**: all six matrix jobs passed on `main` at `bc03d04`
+> ([run 30567649462](https://github.com/nelsonwerd/didrun/actions/runs/30567649462)),
+> running `python -m pytest` and `python -m harness.recall` on each. It was settled the
+> only way it could be — by CI, not here — which is exactly what the row predicted.
+>
+> Nothing else moved. **Gates 1, 3 and 4 remain NOT CLEARED**, and B1–B11, B13 and B14 are
+> all still bets: the corpus legs have never run, so every corpus-wide row is still
+> **BET (UNEXERCISED)**. The **30 of 44** count under *Confidence* is as of 2026-07-29 and
+> is deliberately not restated.
+
 **Date:** 2026-07-29 · **Commit:** `49a8b74` on `v0.2-hardening` · **Python:** 3.14.5 (CPython, arm64)
 · **Platform:** Darwin 25.5.0 (macOS) · **Suite:** 496 passed, 4 skipped
 
