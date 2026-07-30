@@ -21,6 +21,11 @@ import os
 from typing import Optional
 
 from .claims import ENV_DRIFT, ENV_INCOMPARABLE, ENV_MATCH, ENV_NOT_RECORDED
+from .manifest import (
+    AUTHORITY_GRADE,
+    AUTHORITY_LIMITATION,
+    AUTHORITY_PRINCIPAL_BASIS,
+)
 
 # Grade -> (text token, ANSI color, severity marker for NO_COLOR, honest gloss).
 # The token NEVER overclaims: the strongest positive says TREE-EXACT ("the
@@ -95,6 +100,19 @@ def _sanitize(s: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def sanitize_text(value) -> str:
+    """`_sanitize` for the command surfaces outside this module.
+
+    `didrun seal` and `didrun authorize` print an authority's label and principal
+    straight to the terminal, and neither value is computed by this process:
+    `authority.jsonl` is a local, unhashed, gitignored file that gets the same
+    validate-rather-than-trust reading as `claims.jsonl`, so whoever can write it
+    chooses those strings. A newline in a label fabricates a verdict row in the
+    seal's own output, the same way it did in the verify block.
+    """
+    return _sanitize(value if isinstance(value, str) else str(value))
 
 
 def _skipped_notes(n: int) -> str:
@@ -182,6 +200,78 @@ def superseded_text(report) -> str:
     )
 
 
+# The token for a bound authority. Deliberately NOT a row in `_GRADE_DISPLAY` or
+# `_SORT_RANK`: `cited` is an AUTHORITY's grade and never a claim's. No
+# GradeResult carries it, `worst_status` never returns it, and a `_SORT_RANK` row
+# would imply it sorts among the claim grades, which it never does. It is held to
+# the same rule as every token in that table — reported verbatim, never upgraded:
+# `CITED` must never be rendered as "signed", "approved" or "authorized by".
+_AUTHORITY_TOKEN = AUTHORITY_GRADE.upper()
+
+
+def authority_lines(report, indent: str = "  ") -> list:
+    """The block for each authority this note cited, or [] when it cited none.
+
+    The limitation sentence comes from the SOURCE CONSTANT, never from the note.
+    A note is data this process did not compute, so a limitation a note could
+    edit would be no limitation at all — and this is the one string standing
+    between `CITED` and being read as approval.
+
+    An ordinary seal cites nothing, so this returns [] and the verdict gains no
+    line. That is not a rendering choice: an authority attaches only to an
+    exceptional transition (docs/TRUST_MODEL.md).
+    """
+    lines: list = []
+    for entry in report.authority:
+
+        def field(name: str, _entry=entry) -> str:
+            """Every value this block reads out of the note, sanitized at the
+            single point of access.
+
+            Not `_sanitize` spelled out at each use site: that is how `size` and
+            `ttl` ended up as the two of six fields nobody wrapped. An
+            unsanitized value interpolated into these lines can carry newlines,
+            and a newline here fabricates whole verdict rows ABOVE the real
+            table — rows the renderer never computed, in the vocabulary this
+            module exists to keep honest. A note travels over `git fetch`, so it
+            is data from another machine, and `_sanitize` is not optional for
+            any of it. The HTML path already funnels every field through one
+            `esc`; this is the terminal's equivalent.
+            """
+            value = _entry.get(name, "")
+            return _sanitize(value if isinstance(value, str) else str(value))
+
+        scope = field("scope")
+        label = field("label")
+        path = field("artifact_path")
+        # The full digest, not a 12-character prefix like the commit and tree
+        # above it. Comparing this value against a file is the one thing the
+        # feature buys, and printing a prefix would invite a reviewer to compare
+        # a prefix.
+        digest = field("artifact_sha256")
+        size = field("artifact_bytes")
+        principal = field("principal") or "(unnamed)"
+        # From the SOURCE CONSTANT, like the token and the limitation below, and
+        # for the same reason: this field says how the principal's name was
+        # established, so a note that supplied it could print "principal alice
+        # (verified-ssh-signature)" directly above a sentence saying didrun
+        # cannot tell who wrote it. "self-asserted" is the only basis this
+        # version can establish, so it is the only one it will print.
+        basis = _sanitize(AUTHORITY_PRINCIPAL_BASIS)
+        ttl = field("expires_after_seals")
+        lines.append(
+            _c(f"{indent}! {_AUTHORITY_TOKEN} authority for scope {scope}", "33")
+            + f": {label}"
+        )
+        lines.append(f"{indent}    artifact {path}  sha256 {digest}  {size} bytes")
+        lines.append(
+            f"{indent}    principal {principal} ({basis})  ·  "
+            f"expires after {ttl} seal(s)"
+        )
+        lines.append(f"{indent}    {AUTHORITY_LIMITATION}")
+    return lines
+
+
 def _conjunct_token(grade) -> str:
     """The token for one conjunct of a conjunction — never a grade for a name
     that resolved to nothing.
@@ -261,6 +351,9 @@ def render_verdict(report, width: int = 80) -> str:
     lines.append(f"  {env_summary_text(report)}")
     if report.secrets_override:
         lines.append(_c("  ! sealed with --allow-secrets (redacted export)", "33"))
+    # Directly under the override line, because the override is what an authority
+    # is most often cited for and a reader must see the two together.
+    lines.extend(authority_lines(report))
     if report.notes_skipped:
         lines.append(_c(f"  ! {_skipped_notes(report.notes_skipped)}", "33"))
     lines.append("")
@@ -381,6 +474,26 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     superseded = superseded_text(report)
     superseded_html = f"{esc(superseded)} ·" if superseded else ""
 
+    # One block per cited authority, above the table for the same reason as the
+    # chain sentence: it is a statement about the seal, not about a claim, so a
+    # table row would file it alongside the grades. Every field is escaped, and
+    # the limitation, the token and the principal's basis come from source
+    # constants, never from the note.
+    authority_html = "".join(
+        "<div class='authority'>"
+        f"<span class='badge cited'>{esc(_AUTHORITY_TOKEN)}</span> "
+        f"authority for scope {esc(a.get('scope', ''))}: {esc(a.get('label', ''))}"
+        f"<span class='ameta'>artifact {esc(a.get('artifact_path', ''))} · "
+        f"sha256 {esc(a.get('artifact_sha256', ''))} · "
+        f"{esc(a.get('artifact_bytes', ''))} bytes · "
+        f"principal {esc(a.get('principal', '') or '(unnamed)')} "
+        f"({esc(AUTHORITY_PRINCIPAL_BASIS)}) · "
+        f"expires after {esc(a.get('expires_after_seals', ''))} seal(s)</span>"
+        f"<span class='alimit'>{esc(AUTHORITY_LIMITATION)}</span>"
+        "</div>"
+        for a in report.authority
+    )
+
     if all_ok:
         verdict_class, verdict_text = "ok", "ALL RECORDED-EXACT"
     elif worst == "chain-broken":
@@ -445,6 +558,15 @@ def render_html(report, title: str = "didrun evidence report") -> str:
   .chainbanner {{ margin:8px 0; padding:8px 10px; border-radius:3px;
     background:var(--bad-fill); color:var(--on-fill); font-weight:700; }}
   .meta {{ color:var(--dim); font-size:12px; word-break:break-all; }}
+  /* An authority is record, not verdict, so it is toned like the advisory
+     states — never like a pass. The limitation is not small print: it is the
+     same size as the citation it qualifies. */
+  .authority {{ margin:8px 0; padding:8px 10px; border-radius:3px;
+    border:1px solid var(--warn); color:var(--ink); font-size:12px; }}
+  .badge.cited {{ color:var(--warn); }}
+  .authority .ameta {{ display:block; margin-top:4px; color:var(--dim);
+    word-break:break-all; }}
+  .authority .alimit {{ display:block; margin-top:4px; color:var(--warn); }}
   table {{ width:100%; border-collapse:collapse; margin-top:8px; table-layout:fixed; }}
   th {{ text-align:left; color:var(--dim); font-weight:500; font-size:11px;
     text-transform:uppercase; letter-spacing:.05em; padding:8px; border-bottom:1px solid var(--line); }}
@@ -505,6 +627,7 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     <div class="brand">didrun · flight record</div>
     <div class="verdict {verdict_class}">{verdict_text}</div>
     {chain_html}
+    {authority_html}
     <div class="meta">{esc(verified)}/{esc(total)} claims recorded-exact ·
       {esc(report.evidence_bound_count)}/{esc(total)} claims evidence-bound ·
       {superseded_html}

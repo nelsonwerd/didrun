@@ -54,6 +54,68 @@ later. It is also a genuine adoption bet, because voluntary developer commit
 signing is rare in practice. Until it lands, **didrun's guarantees hold only among
 parties who already share a baseline of trust.**
 
+## Operator authority: what `cited` attests
+
+`didrun authorize --artifact <path> --scope <scope> --label "<text>"` records that a
+file with a particular SHA-256 was cited as the authority for one exceptional
+transition. `seal` binds the live citations into the manifest, grades each one
+`cited`, and every surface that shows one prints this sentence beside it:
+
+> cited authority: recorded that a file with this digest was cited for this scope.
+> NOT a signature and NOT approval — didrun cannot tell who wrote it.
+
+**What it attests.** A file with this digest existed at this path and was cited for
+this scope, at this point in an append-only record. The digest, the scope, the label
+and the self-asserted principal are in the note; the artifact's bytes never are.
+
+**What it does not attest — read this part.** It is not evidence that a human wrote,
+read, or approved anything. **An agent can author its own authorization artifact in
+one line**, cite it, and seal. There is no identity here: `principal` is whatever
+`$USER` said, recorded as `self-asserted`, and didrun authenticates nobody. `cited`
+must never be rendered or reported as "signed", "approved", "verified" or
+"authorized by" — the same rule that keeps `tree-exact` from rendering as "verified
+true".
+
+**The one property it buys.** Retroactive fabrication becomes detectable: because the
+digest sits in a note sealed earlier, an artifact edited or written after the fact no
+longer matches what that earlier note recorded. That is a real, narrow gain, and it is
+the whole gain. It converts an authority from prose into a fixed, diffable,
+digest-bound object; it does not make the object trustworthy. It is also not tamper
+resistance — whoever can rewrite a note can rewrite the digest in it, exactly as they
+can rewrite a grade.
+
+**Why it is shaped this way.** `--allow-secrets` was the shipped instance of the
+problem: a bare flag stored as a bare boolean, with no principal, no basis and no
+artifact, so a reader could not tell an authorized override from an agent that simply
+passed the flag. didrun's own thesis is that a claim with no witnessed event grades
+`unknown`; an out-of-band authorization is exactly that shape, and the tool used to
+grade it implicitly true. So authorities are:
+
+- **scoped** — only `allow-secrets` and `reseal`, the exceptional transitions. There
+  is deliberately no scope for an ordinary seal, and none will be added.
+- **expiring** — a TTL counted in seals (default 1, minimum 1, and no value meaning
+  "never"). Seals rather than wall time, because a clock in the trust path is not
+  allowed here.
+- **never required by default** — `seal --require-authority` is opt-in. Any
+  authorization demanded on the happy path becomes a rubber stamp within a week,
+  which is precisely how the information content of `--allow-secrets` reached zero.
+
+**The honest anchor for a stronger tier is a key the agent cannot read.** A
+passphrase-less key in `~/.ssh` that the agent can read is theatre; a hardware-backed
+key with touch-to-sign (`ssh-keygen -t ecdsa-sk`, or a Secure Enclave key) is the real
+anchor, because the human's finger is the thing an agent cannot fake. Two further
+tiers are designed and **not built**:
+
+- **Tier 1 — reuse the key the developer already has.** `git verify-tag` /
+  `git verify-commit` under `gpg.format=ssh` and `~/.ssh/allowed_signers`, recording
+  the signer identity and the verification output. Zero new key management, no crypto
+  inside didrun. **Not built.**
+- **Tier 2 — org identity, roles, revocation, trust roots.** **Not built**, and out of
+  scope for a local single-user tool.
+
+Both are consequences of the deferral in the section above, and neither is claimed
+anywhere in didrun's output.
+
 ## The ledger is secret-bearing
 
 The ledger records everything a session printed — including anything an agent
@@ -70,13 +132,20 @@ exported bundle as **secret-bearing**:
   claim labels and delta paths included. Override with `--allow-secrets`, which
   is logged into the manifest; the exported artifact is redacted either way.
 - **What blocks and what is redacted are the same fields.** Every string in a
-  published claim entry that carries operator- or repository-authored text (the
-  argv preview, the label, the pathspecs, the changed paths) is replaced by a
-  marker before the note is written, and the spans are declared in
-  `redaction.applied` / `redaction.fields`. This is stated because it was once
-  false in the worst direction: a token in a claim label refused the seal and
-  was then published verbatim on the override, under a refusal message that had
-  already promised a redacted artifact. Blocking is not redacting.
+  published entry that carries operator- or repository-authored text is replaced
+  by a marker before the note is written, and the spans are declared in
+  `redaction.applied` / `redaction.fields`. For a claim that is the argv preview,
+  the label, the pathspecs and the changed paths; for a cited authority it is the
+  label, the cited path **and the principal**. This is stated because it was once
+  false in the worst direction, twice: a token in a claim label refused the seal
+  and was then published verbatim on the override, under a refusal message that
+  had already promised a redacted artifact — and when authorities were added,
+  `principal` reproduced it exactly, having been scanned by the whole-manifest
+  backstop but left out of the pass that redacts. Blocking is not redacting. An
+  enumeration of "the fields that carry outside text" also goes stale the moment
+  a field is added, so the authority enumeration is checked for completeness by a
+  test rather than trusted, and a field it does not classify is dropped from the
+  note instead of published.
 - Everything else is **reported loudly and does not stop the seal**: every
   `notice`-tier finding, and any `block`-tier finding confined to the recorded
   output blobs, which stay in a gitignored local ledger and are never published.

@@ -500,10 +500,19 @@ def grade(
                 exit_code=ev.exit_code,
             )
         # Out-of-scope changes exist — display them; cannot claim scope-exact.
+        # The reason names the widening set as well as the count: the exact
+        # prefixes that would have made this scope-exact are already sitting in
+        # `delta`, and reporting only how MANY paths missed made an operator
+        # re-derive by hand something the tool had measured. The count prefix is
+        # unchanged and the set is appended after an em dash, so a consumer
+        # matching the old prefix still matches (docs/COMPAT.md).
         return GradeResult(
             claim,
             GRADE_STALE,
-            reason=f"{len(out_of_scope)} change(s) outside declared pathspecs",
+            reason=(
+                f"{len(out_of_scope)} change(s) outside declared pathspecs"
+                f" — {_widening_hint(c.path for c in out_of_scope)}"
+            ),
             delta=delta,
             supporting_event_index=idx,
             exit_code=ev.exit_code,
@@ -518,6 +527,40 @@ def grade(
         supporting_event_index=idx,
         exit_code=ev.exit_code,
     )
+
+
+# How many prefixes the widening hint names before it summarises the rest. A
+# hint longer than this stops being readable and starts being the delta again,
+# which the caller already has.
+WIDENING_HINT_CAP = 5
+
+
+def _widening_hint(paths) -> str:
+    """The declaration that would have brought ``paths`` into scope, in words.
+
+    ``_within`` is a path-prefix test, so the smallest prefix covering a path is
+    its parent directory — that is the whole derivation. Deduplicated and sorted
+    for determinism, capped at ``WIDENING_HINT_CAP`` with the remainder counted
+    rather than dropped silently. A top-level file has no parent directory but
+    the repository root, and declaring the root would put EVERY path in scope, so
+    it contributes itself: the smallest prefix that covers it and nothing else.
+
+    This is not relevance inference (module docstring: *set arithmetic only*).
+    It changes no grade, and it asserts nothing about whether those paths belong
+    to the claim — only what widening the declaration would have to say.
+    """
+    prefixes = set()
+    for path in paths:
+        stripped = path.strip("/")
+        head, sep, _tail = stripped.rpartition("/")
+        prefixes.add(head + "/" if sep else stripped)
+    ordered = sorted(prefixes)
+    shown = ordered[:WIDENING_HINT_CAP]
+    hint = ", ".join(f"--path {p}" for p in shown)
+    elided = len(ordered) - len(shown)
+    if elided:
+        hint += f" (+{elided} more)"
+    return f"add {hint} to make this scope-exact"
 
 
 def _within(path: str, pathspecs: tuple[str, ...]) -> bool:

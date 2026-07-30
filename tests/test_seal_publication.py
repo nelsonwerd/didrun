@@ -294,6 +294,12 @@ def test_manifest_json_bytes_are_pinned():
     P4.1 adds `claims_from`/`claims_to`, the claim window the seal covered, on
     the same terms: reading defaults of 0 and `len(claims)`, so no stored note
     changes meaning and this stays a deliberate diff rather than a version bump.
+
+    P5.1 adds `authority`, the cited authorization artifacts, with a reading
+    default of `[]` — and it sorts FIRST, so the pinned bytes move at the front.
+    Same terms again: additive, no version bump, one deliberate diff here and one
+    in the compat allowlist. It is a manifest key and not an `Event` field
+    precisely so it can be exactly this: a change no stored note notices.
     """
     m = M.Manifest(
         version=1,
@@ -319,7 +325,8 @@ def test_manifest_json_bytes_are_pinned():
         coverage={"by_coverage": {"complete": 1}, "total_events": 1},
     )
     assert m.to_json() == (
-        b'{"claims":[{"claim":{"argv_preview":["pytest","-q"],"ctype":"tests-pass",'
+        b'{"authority":[],'
+        b'"claims":[{"claim":{"argv_preview":["pytest","-q"],"ctype":"tests-pass",'
         b'"declared_at_index":0,"event_indices":[0],"label":"t","pathspecs":[]},'
         b'"delta":[],"exit_code":0,"grade":"tree-exact","reason":"r",'
         b'"supporting_event_index":0}],'

@@ -571,3 +571,40 @@ overclaim.
    git history survives there as a loose object until the ledger directory is removed by
    hand. Treat the ledger as secret-bearing: it is gitignored by default, and it should
    not be committed, shared, or attached to an issue.
+
+## Known, not closed: a note's authority block is descriptive, not authenticated
+
+Found while closing the authority redaction and rendering defects. Both items below are
+statements about what a *note* can say, not about what it can make didrun do — the note is
+the artifact that crosses machines (`git fetch`), and `docs/TRUST_MODEL.md` already states
+that citation is "not tamper resistance — whoever can rewrite a note can rewrite the digest
+in it". These are recorded because "the note is not authenticated" is easy to state and easy
+to forget field by field.
+
+1. **A note's authority `scope` is rendered as written, and is not re-validated against the
+   scope vocabulary.** `authorize` refuses any scope outside `allow-secrets` / `reseal`, and
+   `_valid_authority` drops a ledger record whose scope is unknown — but a note that has been
+   edited by hand can carry `"scope": "everything"` and `didrun verify` will print
+   `CITED authority for scope everything`. It grants nothing: `--require-authority` gates the
+   seal against the local ledger, never against a fetched note, so a forged scope changes only
+   the description a reader sees. It is left open because the honest fix is a decision about
+   what to render for an unrecognized scope — dropping the block hides that a citation was
+   claimed, and printing it plainly is what it does now — and that decision wants the same
+   treatment the grade vocabulary got, not a quiet clamp.
+
+   The three fields that state *what a citation is worth* are NOT in this position and are
+   pinned to source constants at both bind and render: `grade` (always `cited`), `limitation`
+   (the full sentence) and `principal_basis` (always `self-asserted`). A note supplying
+   `principal_basis: "verified-ssh-signature"` was the reason the last of those three was
+   pinned — it printed `principal <name> (verified-ssh-signature)` two lines above the
+   sentence saying didrun cannot tell who wrote it, in one of the exact words the trust model
+   forbids. Verified by test, both surfaces.
+
+2. **Redaction is not sanitization, and the two run at different times.** A label is scrubbed
+   for secrets before publication; control characters around the secret survive that pass
+   untouched, because a redactor that also rewrote whitespace could not declare faithful
+   spans. Every *terminal* surface therefore sanitizes at the point it prints — the verify
+   authority block, and the `seal` / `authorize` echoes — and the HTML path escapes through
+   one helper. Anything reading a note or `authority.jsonl` programmatically gets the raw
+   strings and must do its own neutralizing; that is the same contract the recorded argv and
+   output already carry.

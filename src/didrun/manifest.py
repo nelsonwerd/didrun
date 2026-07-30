@@ -25,7 +25,9 @@ are out of scope (see docs/COMPAT.md).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -110,6 +112,13 @@ class Manifest:
     # (docs/COMPAT.md).
     claims_from: int = 0
     claims_to: Optional[int] = None
+    # The authorisation artifacts this seal cited for its exceptional
+    # transitions, each graded `cited` and each carrying AUTHORITY_LIMITATION.
+    # A MANIFEST field and never an Event field: a reference to an external
+    # artifact inside the chain preimage would make every future rotation of
+    # that artifact a schema break (docs/COMPAT.md). Additive, defaults to [],
+    # read with .get(): no MANIFEST_VERSION bump.
+    authority: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # The reading default for `claims_to`, applied once so every consumer
@@ -133,6 +142,7 @@ class Manifest:
                 "secrets": self.secrets,
                 "claims_from": self.claims_from,
                 "claims_to": self.claims_to,
+                "authority": self.authority,
             }
         )
 
@@ -198,6 +208,13 @@ class Manifest:
             raise ManifestFormatError(
                 f"manifest `claims` is a {type(d['claims']).__name__}, not a list"
             )
+        # A note published before operator authority existed carries no key, and
+        # "no authority was cited" is exactly what [] says. A non-list is read as
+        # [] for the same reason: an authority block is record, never verdict, so
+        # a malformed one must not raise on a path that reads the rest fine.
+        authority = d.get("authority", [])
+        if not isinstance(authority, list):
+            authority = []
         return cls(
             version=version,
             commit=d["commit"],
@@ -208,6 +225,7 @@ class Manifest:
             secrets=d.get("secrets", {}),
             claims_from=d.get("claims_from", 0),
             claims_to=d.get("claims_to"),
+            authority=authority,
         )
 
 
@@ -315,6 +333,7 @@ def seal(
     write_notes: bool = True,
     bundle_path: Optional[Path] = None,
     reseal: bool = False,
+    require_authority: bool = False,
 ) -> Manifest:
     """Compile, redact, and attach a manifest for ``commitish``.
 
@@ -330,6 +349,11 @@ def seal(
     window this seal would NARROW, unless ``reseal`` is True. That overwrite was
     silent and lossy: `git notes add -f` force-replaces, and a seal scoped to
     `all_claims[watermark:]` replaced a wide record with a narrow one.
+
+    ``require_authority`` refuses an exceptional transition — ``allow_secrets``
+    or ``reseal`` — that no live `cited` authority covers. Default off: an
+    authorisation on the happy path becomes a rubber stamp, so an ordinary seal
+    demands nothing and binds nothing.
     """
     repo = Path(repo)
     commit = gitplumbing.head_commit(repo) if commitish == "HEAD" else _rev(repo, commitish)
@@ -338,6 +362,22 @@ def seal(
     tree = gitplumbing.commit_tree(repo, commit)
     if tree is None:
         raise ManifestError(f"cannot resolve tree for commit {commit}")
+
+    # Authorities first, and the refusal with them: it is a statement about the
+    # INVOCATION, so it must cost nothing and write nothing when it fires. The
+    # scopes are the exceptional transitions this seal actually performs — an
+    # ordinary seal performs none, binds none, and gains no line anywhere.
+    authority_scopes = tuple(
+        scope
+        for scope, requested in (
+            (AUTHORITY_ALLOW_SECRETS, allow_secrets),
+            (AUTHORITY_RESEAL, reseal),
+        )
+        if requested
+    )
+    bound_authority = _bind_authorities(session, authority_scopes, _seal_count(session))
+    if require_authority:
+        _require_authority(authority_scopes, bound_authority)
 
     # Entries, not just events: the seal records WHICH recorded entry backed
     # each claim, and an entry's chain hash is the only handle on that which
@@ -412,6 +452,13 @@ def seal(
     claims_payload = [rc.payload for rc in redacted]
     field_findings = [f for rc in redacted for f in rc.findings]
     field_bytes = sum(rc.bytes_scanned for rc in redacted)
+    # The authority block is published, so it is scanned and redacted by the same
+    # pass, on the same rule as the claim fields above.
+    authority_payload, authority_findings, authority_bytes = _redact_authorities(
+        bound_authority
+    )
+    field_findings.extend(authority_findings)
+    field_bytes += authority_bytes
     coverage = _coverage_statement(session)
     export_bytes = canonical_json(
         {
@@ -422,6 +469,7 @@ def seal(
             "coverage": coverage,
             "claims_from": watermark,
             "claims_to": len(all_claims),
+            "authority": authority_payload,
         }
     )
     scan = _scan_for_secrets(
@@ -445,6 +493,7 @@ def seal(
         secrets=scan.to_dict(overridden),
         claims_from=watermark,
         claims_to=len(all_claims),
+        authority=authority_payload,
     )
 
     # Publication and the watermark are one atomic pair. A published note with
@@ -508,6 +557,12 @@ class VerifyReport:
     # units red on routine noise. The flag is recorded on the report so a reader
     # can tell which of the two verdicts they are looking at.
     require_env_match: bool = False
+    # The authorities the note says this seal cited, as published. Record, never
+    # verdict: an authority does not enter `worst_status` or `all_verified`, and
+    # it cannot make a red note green. `cited` attests that a file with that
+    # digest was cited — not that anyone approved anything — which is why it
+    # grades nothing and only renders.
+    authority: list = field(default_factory=list)
 
     @property
     def chain_faulted(self) -> bool:
@@ -756,6 +811,10 @@ def verify(
         chain_broken_index=chain_index,
         chain_reason=chain_reason,
         require_env_match=require_env_match,
+        # Entries that are not objects are dropped: the block is rendered, and a
+        # renderer walking a string as if it were a record is how a malformed
+        # note becomes a traceback out of `verify`.
+        authority=[a for a in manifest.authority if isinstance(a, dict)],
     )
 
 
@@ -1087,6 +1146,23 @@ def _last_seal_watermark(session: Session) -> int:
     return watermark
 
 
+def _seal_count(session: Session) -> int:
+    """How many seals this ledger has recorded — the authority expiry clock.
+
+    Seals, not wall time. A time-based TTL would put a clock in the trust path,
+    which is a hard invariant this package does not break, and it would make an
+    authority's liveness depend on how long a build took. A seal is the
+    transition an authority is cited for, so counting them is the measure that
+    means something.
+    """
+    path = _seals_path(session)
+    if not path.exists():
+        return 0
+    return sum(
+        1 for line in path.read_text(encoding="ascii").splitlines() if line.strip()
+    )
+
+
 def _record_seal(session: Session, commit: str, tree: str, claims_watermark: int) -> None:
     # Private-append: these carry operator-authored labels and commit ids into
     # the secret-bearing ledger directory, and a plain open() would create them
@@ -1127,6 +1203,377 @@ def _load_claims(session: Session) -> list[Claim]:
         if line:
             claims.append(Claim.from_dict(json.loads(line)))
     return claims
+
+
+# --- operator authority ------------------------------------------------------
+#
+# didrun's thesis is that a claim with no witnessed event grades `unknown`. An
+# out-of-band human authorisation is structurally a claim with no witnessed
+# event, and `--allow-secrets` is the shipped instance: a bare argv flag stored
+# as a bare boolean, with no principal, no basis, and no way for a reader to
+# tell an authorised override from an agent that simply passed the flag.
+#
+# What this converts that into is narrow and is stated on every surface: "someone
+# passed a flag citing an artifact with this digest, at this point in an
+# append-only record". It is NOT evidence that a human approved anything — an
+# agent can author its own authorisation artifact in one line. Signing is
+# deferred (docs/TRUST_MODEL.md) and this does not close that gap; the honest
+# anchor for a stronger tier is a key the agent cannot read.
+
+# The scopes an authority may be cited for: the exceptional transitions, and only
+# those. There is deliberately no scope for an ordinary seal — an authorisation
+# required on the happy path becomes a rubber stamp within a week, which is
+# exactly how `--allow-secrets`'s information content went to zero.
+AUTHORITY_ALLOW_SECRETS = "allow-secrets"
+AUTHORITY_RESEAL = "reseal"
+AUTHORITY_SCOPES = (AUTHORITY_ALLOW_SECRETS, AUTHORITY_RESEAL)
+
+# The grade a bound authority carries, in the same vocabulary as `tree-exact` and
+# under the same rule: reported verbatim, never upgraded. `cited` never renders as
+# "signed", "approved", "verified" or "authorized by".
+AUTHORITY_GRADE = "cited"
+
+# How the principal was established. One value, because there is exactly one
+# mechanism: didrun read $USER, or the operator typed a name. Recorded as a field
+# rather than left implicit so a reader cannot mistake it for an authenticated
+# identity.
+AUTHORITY_PRINCIPAL_BASIS = "self-asserted"
+
+# Default TTL in seals when the operator names none. One, not unbounded: a
+# standing grant is the shape `--allow-secrets` already had, and re-earning the
+# citation per transition is the only thing that keeps it from routine-ising.
+AUTHORITY_DEFAULT_TTL = 1
+
+# The feature's honesty, as a constant that ships in the source and is printed on
+# every surface that shows an authority — the terminal verdict, the HTML report,
+# `authorize`'s own output, and the note itself. It lives here rather than only in
+# the docs because a reader of a note or a verdict is not reading the docs, and
+# `"grade": "cited"` with nothing beside it would be read as approval.
+AUTHORITY_LIMITATION = (
+    "cited authority: recorded that a file with this digest was cited for this "
+    "scope. NOT a signature and NOT approval — didrun cannot tell who wrote it."
+)
+
+_DIGEST_CHUNK = 1 << 20
+
+
+def _authority_path(session: Session) -> Path:
+    return session.root / "authority.jsonl"
+
+
+def _artifact_digest(path: Path) -> tuple:
+    """(sha256 hex, byte count) for the cited artifact. Never its bytes.
+
+    Chunked because an operator may cite a large file and there is no reason to
+    hold it in memory. The digest is the only thing that leaves this function:
+    an authorisation artifact is exactly the kind of file that carries a
+    credential in passing, and the note it would ride into is the one artifact
+    that leaves the machine.
+    """
+    digest = hashlib.sha256()
+    total = 0
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(_DIGEST_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+    return digest.hexdigest(), total
+
+
+def declare_authority(
+    session: Session,
+    artifact: Path,
+    scope: str,
+    label: str,
+    principal: Optional[str] = None,
+    expires_after_seals: Optional[int] = None,
+) -> dict:
+    """Record that a file with this digest was cited as the authority for a scope.
+
+    Refuses a scope outside ``AUTHORITY_SCOPES``, an empty label, a TTL below
+    one, and an artifact that does not exist or is empty. An empty file is
+    refused rather than digested because its digest is a constant: every empty
+    authorisation in the world shares it, so it distinguishes nothing and would
+    be the one shape a fabricated citation could produce without a file.
+
+    The path is recorded as the operator wrote it and is not resolved. A relative
+    citation therefore stays relative, which keeps a home directory out of a
+    published note when the operator cites one relatively; an absolute path is
+    published as typed.
+    """
+    if scope not in AUTHORITY_SCOPES:
+        raise ManifestError(
+            f"unknown authority scope {scope!r}: didrun authorises only the "
+            f"exceptional transitions ({', '.join(AUTHORITY_SCOPES)}). There is "
+            f"no scope for an ordinary seal, and none will be added: an "
+            f"authorisation required on the happy path becomes a rubber stamp."
+        )
+    if not label or not label.strip():
+        raise ManifestError(
+            "an authority needs a --label saying what is being authorised; "
+            "an unlabelled citation records nothing a reader can act on"
+        )
+    ttl = AUTHORITY_DEFAULT_TTL if expires_after_seals is None else expires_after_seals
+    if not _is_index(ttl) or ttl < 1:
+        raise ManifestError(
+            f"--expires-after-seals must be an integer >= 1 (got {ttl!r}); an "
+            f"authority that expires after zero seals authorises nothing, and "
+            f"there is no value meaning 'never'"
+        )
+    artifact = Path(artifact)
+    if not artifact.is_file():
+        raise ManifestError(
+            f"cannot cite {artifact}: no such file (an authority cites an "
+            f"artifact that exists, so the digest is of something a reviewer "
+            f"can open)"
+        )
+    sha256, size = _artifact_digest(artifact)
+    if size == 0:
+        raise ManifestError(
+            f"cannot cite {artifact}: the file is empty, and every empty file "
+            f"has the same digest — it would distinguish nothing"
+        )
+    record = {
+        "principal": (
+            principal if principal is not None else os.environ.get("USER", "")
+        ),
+        "principal_basis": AUTHORITY_PRINCIPAL_BASIS,
+        "artifact_path": str(artifact),
+        "artifact_sha256": sha256,
+        "artifact_bytes": size,
+        "scope": scope,
+        "label": label,
+        "declared_at_index": _seal_count(session),
+        "expires_after_seals": ttl,
+    }
+    # Same append discipline as claims and seals: 0600 at creation, under the
+    # ledger-wide lock. A record line carries an operator-authored label and is
+    # not bounded by PIPE_BUF, so two concurrent `didrun authorize` invocations
+    # could otherwise interleave into one unparseable record.
+    with _append_lock(session.root):
+        with _open_private_append(_authority_path(session)) as fh:
+            fh.write(canonical_json(record) + b"\n")
+    return record
+
+
+def _valid_authority(record) -> bool:
+    """Whether a stored authority record is one this seal may read.
+
+    ``authority.jsonl`` is a local, gitignored, unhashed file, exactly like
+    ``claims.jsonl`` — so every field here arrived from a file rather than from
+    this process, and gets the same validate-rather-than-trust reading that
+    ``_superseded_by`` gets. Not a forgery barrier and not presented as one:
+    whoever can write this file can write a well-formed record.
+    """
+    if not isinstance(record, dict):
+        return False
+    if record.get("scope") not in AUTHORITY_SCOPES:
+        return False
+    if not _is_index(record.get("declared_at_index")) or record["declared_at_index"] < 0:
+        return False
+    if not _is_index(record.get("expires_after_seals")) or record["expires_after_seals"] < 1:
+        return False
+    digest = record.get("artifact_sha256")
+    if not isinstance(digest, str) or len(digest) != 64:
+        return False
+    if any(c not in "0123456789abcdef" for c in digest):
+        return False
+    if not _is_index(record.get("artifact_bytes")) or record["artifact_bytes"] < 1:
+        return False
+    for key in ("principal", "artifact_path", "label"):
+        if not isinstance(record.get(key), str):
+            return False
+    return True
+
+
+def _load_authorities(session: Session) -> tuple:
+    """Every readable authority record, plus how many were dropped.
+
+    A record that does not validate is DROPPED. Dropping is the refusing
+    direction: an authority grants permission, so ignoring a malformed one
+    produces a refusal the operator can see and fix, while trusting it would
+    produce a permission nobody granted. A torn tail therefore costs a
+    citation, never a false one.
+    """
+    path = _authority_path(session)
+    if not path.exists():
+        return [], 0
+    records = []
+    dropped = 0
+    for line in path.read_text(encoding="ascii", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            dropped += 1
+            continue
+        if _valid_authority(record):
+            records.append(record)
+        else:
+            dropped += 1
+    return records, dropped
+
+
+def _bind_authorities(session: Session, scopes: tuple, seal_index: int) -> list:
+    """The authorities this seal cites, graded ``cited``.
+
+    Three conditions, every one of them fail-closed:
+
+    * **Scope** — the record's scope is one this seal actually exercises. An
+      ordinary seal exercises none and therefore binds none, which is what keeps
+      an authority attached to exceptional transitions instead of becoming a line
+      on every note.
+    * **Not expired** — ``seal_index - declared_at_index < expires_after_seals``.
+      The clock starts at the seal that follows the authorisation, so
+      ``--expires-after-seals 1`` covers the next seal and not the one after.
+    * **Not from the future** — a record may not name a seal generation that has
+      not happened (``declared_at_index <= seal_index``). That is the guard
+      against a record written or backdated by hand to cover seals it never saw.
+
+    ``limitation``, ``grade`` and ``principal_basis`` are written into every
+    bound entry from their SOURCE CONSTANTS so the note itself carries them,
+    not just the surfaces that render it — and so a hand-edited
+    ``authority.jsonl`` cannot dictate the three fields that state how much the
+    citation is worth. ``principal_basis`` belongs in that set because it
+    qualifies the principal: "self-asserted" is the only basis this version can
+    establish, so it is the only basis it will publish.
+    """
+    records, dropped = _load_authorities(session)
+    if dropped:
+        print(
+            f"didrun seal: WARNING: dropped {dropped} unreadable authority "
+            f"record(s) from the ledger; they authorise nothing. A dropped "
+            f"record is the refusing direction, so a scope that needed one is "
+            f"refused rather than granted.",
+            file=sys.stderr,
+        )
+    bound = []
+    for record in records:
+        if record["scope"] not in scopes:
+            continue
+        declared = record["declared_at_index"]
+        if declared > seal_index:
+            continue
+        if seal_index - declared >= record["expires_after_seals"]:
+            continue
+        entry = dict(record)
+        entry["grade"] = AUTHORITY_GRADE
+        entry["limitation"] = AUTHORITY_LIMITATION
+        entry["principal_basis"] = AUTHORITY_PRINCIPAL_BASIS
+        bound.append(entry)
+    return bound
+
+
+def _require_authority(scopes: tuple, bound: list) -> None:
+    """Refuse a transition whose scope no live cited authority covers.
+
+    Default off, and it stays that way: making it default-on would put an
+    authorisation on the happy path, which is the failure mode this whole design
+    is shaped around. It exists for a CI gate that wants "a bare
+    `--allow-secrets` is not enough", and it says nothing stronger than that —
+    the authority it demands is still only a citation.
+    """
+    covered = {entry["scope"] for entry in bound}
+    missing = [scope for scope in scopes if scope not in covered]
+    if not missing:
+        return
+    raise ManifestError(
+        "--require-authority: no live cited authority with scope "
+        + ", ".join(repr(s) for s in missing)
+        + f". Declare one with `didrun authorize --artifact <path> --scope "
+        f"{missing[0]} --label \"<text>\"` and re-run. {AUTHORITY_LIMITATION}"
+    )
+
+
+# How `_redact_authorities` must treat every key a bound authority carries. The
+# split is exhaustive BY CONSTRUCTION: the pass publishes a key only if it is
+# named here, so a field added later is dropped rather than published unscanned,
+# and `test_every_authority_field_is_classified` fails the moment
+# `declare_authority` grows a field nobody classified.
+#
+# Enumerating the text fields by hand, with no check that the enumeration was
+# complete, is exactly what published `principal` verbatim into a git note while
+# the refusal message promised a redacted export. The enumeration is no longer
+# allowed to be silently incomplete.
+_AUTHORITY_TEXT_FIELDS = (
+    # (field name, the FindingSource kind its content is scanned as)
+    ("label", "label"),
+    ("artifact_path", "pathspec"),
+    # `--principal`, or `$USER` when that is absent. Outside text, exactly as
+    # much as the label is, and published in the same JSON object.
+    ("principal", "label"),
+)
+
+# Computed here, validated by `_valid_authority`, or pinned from a source
+# constant by `_bind_authorities`. None of these can carry outside text, which
+# is why they are published as-is — the reason is recorded per field because
+# "this one is safe" is the claim that has to stay true.
+_AUTHORITY_PASSTHROUGH_FIELDS = frozenset(
+    {
+        "artifact_sha256",      # computed here; validated as 64 lowercase hex
+        "artifact_bytes",       # computed here; validated as an int >= 1
+        "scope",                # closed vocabulary (AUTHORITY_SCOPES)
+        "declared_at_index",    # computed here; validated as an int >= 0
+        "expires_after_seals",  # validated as an int >= 1
+        "principal_basis",      # source constant, pinned at bind
+        "grade",                # source constant, pinned at bind
+        "limitation",           # source constant, pinned at bind
+    }
+)
+
+
+def _redact_authorities(bound: list) -> tuple:
+    """Scrub the operator-authored strings in the bound authorities.
+
+    Returns ``(payload, findings, bytes_scanned)`` — the same three things
+    ``_redact_result`` returns for a claim, and for the same reason: the
+    findings ARE the export gate's input for these fields, so an authority
+    label cannot be blocked-but-published. That pair coming apart is the exact
+    defect the claim-field pass exists to have closed, and a field added later
+    reintroduces it unless it is redacted by the pass that reports it.
+
+    THREE fields carry outside text: the label, the cited path and the principal.
+    They are listed in ``_AUTHORITY_TEXT_FIELDS`` and every one of them goes
+    through ``redact_field``. Everything else is published only if
+    ``_AUTHORITY_PASSTHROUGH_FIELDS`` vouches for it; an unclassified key is
+    dropped, because the failing direction for a field nobody has thought about
+    is to leave it out of the artifact that leaves the machine.
+
+    Findings are located by field NAME rather than by an authority index —
+    ``FindingSource`` addresses claims and streams, and widening it is a change
+    to the projection contract, not to this unit — so the precise address
+    travels in ``redaction.fields`` instead.
+    """
+    payload = []
+    findings: list = []
+    scanned = 0
+    for index, entry in enumerate(bound):
+        fields: list = []
+
+        def _field(name: str, kind: str, value) -> str:
+            nonlocal scanned
+            text = value if isinstance(value, str) else str(value)
+            scanned += len(text.encode("utf-8", "replace"))
+            redaction = redact.redact_field(name, text, redact.FindingSource(kind))
+            fields.extend(redaction.applied)
+            findings.extend(redaction.findings)
+            return redaction.text
+
+        out = {k: v for k, v in entry.items() if k in _AUTHORITY_PASSTHROUGH_FIELDS}
+        for name, kind in _AUTHORITY_TEXT_FIELDS:
+            if name in entry:
+                out[name] = _field(f"authority[{index}].{name}", kind, entry[name])
+        out["redaction"] = {
+            "projection_version": redact.PROJECTION_VERSION,
+            "detector_set_version": redact.DETECTOR_SET_VERSION,
+            "fields": fields,
+        }
+        payload.append(out)
+    return payload, findings, scanned
 
 
 # --- helpers -----------------------------------------------------------------

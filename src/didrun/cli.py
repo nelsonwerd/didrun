@@ -1,6 +1,6 @@
 """didrun command-line interface.
 
-Five commands: run, claim, seal, verify, show.
+Six commands: run, claim, authorize, seal, verify, show.
 `log` is subsumed by `show`; `report` is a `--html` flag on show/verify.
 
 The CLI is a thin shell over the library; all behavior lives in the modules so
@@ -95,8 +95,8 @@ def cmd_claim(args) -> int:
     indices: tuple = ()
     if args.type == CONJUNCTION:
         # A conjunction binds no event — it conjoins claims that carry their own
-        # witnessed events — so the "no successful event to bind" refusal below
-        # is not its refusal. `--event` and `--path` are refused rather than
+        # witnessed events — so the "most recent event did not exit 0" refusal
+        # below is not its refusal. `--event` and `--path` are refused rather than
         # silently ignored: an operator who passed one meant something by it.
         if args.event is not None:
             print(
@@ -121,16 +121,45 @@ def cmd_claim(args) -> int:
                 file=sys.stderr,
             )
             return 2
-        # Default: bind to the most recent successful event.
+        # Default: bind to the LAST event, never to the last *successful* one.
+        #
+        # Searching backwards for a success is the failure this tool exists to
+        # prevent, reachable through the documented happy path: run the tests
+        # (pass), edit, run them again (fail), `didrun claim tests-pass` — the
+        # claim bound the older passing event, `declared_at_index` was still the
+        # last index so the retroactive-binding rule did not catch it, and if the
+        # tree had not moved it graded tree-exact. The only signal was the index
+        # in a success line nobody reads. Refuse instead: an operator who really
+        # means an earlier event says so with --event N, which is deliberate and
+        # is warned about below.
         if args.event is not None:
             indices = (args.event,)
+            gap = len(events) - 1 - args.event
+            if gap > 0:
+                print(
+                    f"didrun claim: binding to event {args.event}, {gap} event(s) "
+                    f"before the most recent (index {len(events) - 1})",
+                    file=sys.stderr,
+                )
         else:
-            indices = tuple(
-                i for i, ev in enumerate(events) if ev.exit_code == 0
-            )[-1:]  # last success
-        if not indices:
-            print("didrun claim: no successful event to bind (last command did not exit 0)", file=sys.stderr)
-            return 2
+            last = len(events) - 1
+            recent = events[last]
+            if recent.exit_code != 0:
+                witness = (
+                    f"exited {recent.exit_code}"
+                    if recent.exit_code is not None
+                    else "recorded no exit code (interrupted, or capture that "
+                    "witnesses no exit)"
+                )
+                print(
+                    f"didrun claim: the most recent event (index {last}) "
+                    f"{witness} — refusing to bind this claim to an earlier "
+                    f"event that passed. Pass --event N to bind an earlier "
+                    f"event deliberately.",
+                    file=sys.stderr,
+                )
+                return 2
+            indices = (last,)
     try:
         claim = Claim(
             ctype=args.type,
@@ -155,6 +184,52 @@ def cmd_claim(args) -> int:
     return 0
 
 
+def cmd_authorize(args) -> int:
+    """Record that a cited artifact is the authority for one scope.
+
+    Prints the digest and, verbatim, the limitation constant. The limitation is
+    printed here and not only in the docs because this command's output is where
+    an operator forms their idea of what the record means, and what it means is
+    much less than "approved".
+    """
+    repo = Path(args.repo or os.getcwd())
+    session = _session(repo)
+    try:
+        record = _manifest.declare_authority(
+            session,
+            Path(args.artifact),
+            scope=args.scope,
+            label=args.label,
+            principal=args.principal,
+            expires_after_seals=args.expires_after_seals,
+        )
+    except _manifest.ManifestError as exc:
+        print(f"didrun authorize: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"didrun authorize: cannot read the cited artifact: {exc}", file=sys.stderr)
+        return 2
+    # Sanitized, like every other terminal surface that prints a string this
+    # process did not compute: the label, the principal and the path are argv.
+    text = render.sanitize_text
+    print(
+        f"recorded {_manifest.AUTHORITY_GRADE} authority for scope "
+        f"{text(record['scope'])}: {text(record['label'])}"
+    )
+    print(
+        f"  artifact {text(record['artifact_path'])}  "
+        f"sha256 {text(record['artifact_sha256'])}  "
+        f"{text(record['artifact_bytes'])} bytes"
+    )
+    print(
+        f"  principal {text(record['principal']) or '(unnamed)'} "
+        f"({_manifest.AUTHORITY_PRINCIPAL_BASIS})  ·  "
+        f"expires after {text(record['expires_after_seals'])} seal(s)"
+    )
+    print(f"  {_manifest.AUTHORITY_LIMITATION}")
+    return 0
+
+
 def cmd_seal(args) -> int:
     repo = Path(args.repo or os.getcwd())
     session = _session(repo)
@@ -166,6 +241,7 @@ def cmd_seal(args) -> int:
             allow_secrets=args.allow_secrets,
             bundle_path=Path(args.bundle) if args.bundle else None,
             reseal=args.reseal,
+            require_authority=args.require_authority,
         )
     except _manifest.redact.SecretsBlocked as exc:
         print(f"didrun seal: {exc}", file=sys.stderr)
@@ -193,6 +269,21 @@ def cmd_seal(args) -> int:
         + f"{blocking + noticed} findings ({blocking} block / {noticed} notice)"
         + ("  [--allow-secrets]" if m.secrets_override else "")
     )
+    # What authorised the exceptional transition, if anything did — printed at the
+    # moment the citation is published, with the limitation attached. An ordinary
+    # seal cites nothing and prints nothing extra.
+    # Sanitized for the same reason the verify block is: these strings came from
+    # `authority.jsonl`, and redaction is not sanitization — a scrubbed label
+    # still carries whatever control characters were written around the secret.
+    for entry in m.authority:
+        print(
+            f"  {_manifest.AUTHORITY_GRADE} authority for scope "
+            f"{render.sanitize_text(entry.get('scope', ''))}: "
+            f"{render.sanitize_text(entry.get('label', ''))}  "
+            f"sha256 {render.sanitize_text(entry.get('artifact_sha256', ''))}"
+        )
+    if m.authority:
+        print(f"  {_manifest.AUTHORITY_LIMITATION}")
     return 0
 
 
@@ -362,7 +453,15 @@ def build_parser() -> argparse.ArgumentParser:
     # would keep refusing a type the library had accepted for a release.
     pc.add_argument("type", choices=list(CLAIM_TYPES))
     pc.add_argument("--label", help="human label (default: the type)")
-    pc.add_argument("--event", type=int, help="bind to a specific event index")
+    pc.add_argument(
+        "--event",
+        type=int,
+        help=(
+            "bind to a specific event index, warning when it is not the most "
+            "recent. Default: the most recent event, and a claim is refused "
+            "rather than bound to an earlier one when that event did not exit 0"
+        ),
+    )
     pc.add_argument("--path", action="append", help="declare a pathspec for scope-exact grading")
     pc.add_argument(
         "--of",
@@ -376,6 +475,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pc.set_defaults(func=cmd_claim)
 
+    pa = sub.add_parser(
+        "authorize",
+        help=(
+            "record a cited authorization artifact for one exceptional scope "
+            "(stores the digest, never the bytes; NOT a signature)"
+        ),
+    )
+    pa.add_argument(
+        "--artifact",
+        required=True,
+        help="path to the authorization artifact; its sha256 is recorded, its bytes are not",
+    )
+    pa.add_argument(
+        "--scope",
+        required=True,
+        choices=list(_manifest.AUTHORITY_SCOPES),
+        help=(
+            "the exceptional transition this authority covers. There is no scope "
+            "for an ordinary seal: an authorisation on the happy path becomes a "
+            "rubber stamp"
+        ),
+    )
+    pa.add_argument("--label", required=True, help="what is being authorised, in words")
+    pa.add_argument(
+        "--principal",
+        help=(
+            "who is citing it (default: $USER). Recorded as SELF-ASSERTED — "
+            "didrun authenticates nobody"
+        ),
+    )
+    pa.add_argument(
+        "--expires-after-seals",
+        type=int,
+        metavar="N",
+        help=(
+            f"how many seals the citation covers, starting with the next one "
+            f"(default: {_manifest.AUTHORITY_DEFAULT_TTL}). There is no value "
+            f"meaning 'never' — a standing grant is what this replaces"
+        ),
+    )
+    pa.set_defaults(func=cmd_authorize)
+
     ps = sub.add_parser("seal", help="compile and attach a commit-bound manifest")
     ps.add_argument("--commit", help="commit to bind (default: HEAD)")
     ps.add_argument("--allow-secrets", action="store_true", help="export despite secret findings (redacted; logged)")
@@ -387,6 +528,16 @@ def build_parser() -> argparse.ArgumentParser:
             "permit replacing this commit's note with a NARROWER record: the "
             "claims the replaced note held and this seal does not are then in "
             "no note at all. Without it, a narrowing re-seal is refused"
+        ),
+    )
+    ps.add_argument(
+        "--require-authority",
+        action="store_true",
+        help=(
+            "refuse --allow-secrets or --reseal unless a live cited authority "
+            "covers that scope (see `didrun authorize`). Default off: an "
+            "authorisation required on every seal becomes a rubber stamp. The "
+            "authority it demands is a citation, not an approval"
         ),
     )
     ps.set_defaults(func=cmd_seal)

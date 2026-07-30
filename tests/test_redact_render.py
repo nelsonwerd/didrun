@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from didrun import redact
 from didrun import render
@@ -74,6 +74,11 @@ def _report(results, all_verified=False, worst="stale", chain="intact",
         chain_reason: str = chain_why
         # Mirrors VerifyReport's environment fields, for the same reason.
         require_env_match: bool = gating
+        # Mirrors VerifyReport's authority block, for the same reason. Empty on
+        # purpose: every surface test in this file renders a report that cited
+        # nothing, which is what pins "an ordinary verdict gains no authority
+        # line". The cited case lives in tests/test_operator_authority.py.
+        authority: list = field(default_factory=list)
 
         @property
         def worst_status(self):

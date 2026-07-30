@@ -314,10 +314,16 @@ def test_leg1_chain_recompute(replay_source):
 # live inside a claim entry, and a claim entry round-trips verbatim — so v3's
 # allowlist is v2's. It is spelled out rather than aliased so that a v3-only
 # additive key stays a deliberate one-line diff here, exactly as for v1 and v2.
+# `authority` is P5.1's: the authorisation artifacts a seal cited, each carrying
+# its digest and the limitation constant. Additive with a v1-reproducing default
+# ([]) and NO version bump — an authority is a manifest field, never an Event
+# field, precisely so it stays compat-neutral. A stored note of any version may
+# legitimately lack it (every note published before P5.1 does), so all three
+# allowlists carry it. Third deliberate one-line diff this criterion has forced.
 MANIFEST_ADDITIVE_KEYS = {
-    1: frozenset({"secrets_override", "secrets", "claims_from", "claims_to"}),
-    2: frozenset({"secrets_override", "secrets", "claims_from", "claims_to"}),
-    3: frozenset({"secrets_override", "secrets", "claims_from", "claims_to"}),
+    1: frozenset({"secrets_override", "secrets", "claims_from", "claims_to", "authority"}),
+    2: frozenset({"secrets_override", "secrets", "claims_from", "claims_to", "authority"}),
+    3: frozenset({"secrets_override", "secrets", "claims_from", "claims_to", "authority"}),
 }
 
 

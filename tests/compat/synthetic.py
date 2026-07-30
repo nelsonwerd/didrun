@@ -387,7 +387,13 @@ def build_corpus(root: Path) -> SyntheticCorpus:
             coverage=_coverage(),
         ).to_json()
     )
-    for added_after_v1 in ("secrets_override", "secrets", "claims_from", "claims_to"):
+    for added_after_v1 in (
+        "secrets_override",
+        "secrets",
+        "claims_from",
+        "claims_to",
+        "authority",
+    ):
         del body_d[added_after_v1]
     _strip_post_v2_claim_keys(body_d)
     _attach_note(root, commit_d, canonical_json(body_d))
