@@ -79,13 +79,22 @@ above exists to prevent.
 
 ### Version 3 — the claim-type vocabulary gained `conjunction`
 
-**A v3 note may contain a claim whose `ctype` is `conjunction`, and reading it in a binary
-whose claim vocabulary does not include that type is not a graded refusal but an uncaught
-traceback: `verify` calls `Claim.from_dict` outside the `try` that grades a claim, so
-`ClaimError: unknown claim type: 'conjunction'` propagates out of the command.** That is
+**A v3 note may contain a claim whose `ctype` is `conjunction`, and in a released binary
+whose claim vocabulary does not include that type — v0.1, or a v0.2 built before the
+refusal below landed — reading it is not a graded refusal but an uncaught traceback:
+`verify` called `Claim.from_dict` outside the `try` that grades a claim, so
+`ClaimError: unknown claim type: 'conjunction'` propagated out of the command.** That is
 the vocabulary break, stated at full strength — "raises" understates it, and the
 `MANIFEST_VERSION` bump to 3 exists so a v0.1 or early-v0.2 reader refuses the note on its
 version *before* it reaches the claim it cannot parse.
+
+**THIS reader no longer behaves that way, and the distinction matters when reading the rest
+of this section.** A later unit closed the same hole from this end: a claim type this
+binary cannot parse, in a note whose version it accepts, is now a whole-manifest refusal
+naming the entry — `claim entry 0 is unreadable: unknown claim type: '…'`, exit 2, no
+traceback. Measured. See *An unreadable note is a graded refusal* below. The paragraph
+above describes what a note published by this version does **when it travels backwards to
+an older binary**, which is the forward incompatibility this section is about.
 
 There is no way to extend a closed vocabulary without that break. The alternative —
 skipping claim types a reader does not know — is worse: the note would silently
@@ -522,7 +531,10 @@ note from being read as a verdict.
 
 Stored evidence is unaffected: every note ever published carries an integer version of 1, 2
 or 3 and the required fields, so nothing legitimately published is newly refused. The
-compat corpus replays all three versions.
+compat harness's **synthetic** fixtures cover all three versions and the per-version
+additive-key allowlists; the **real** archive replay is still unexercised, so "nothing
+legitimately published is newly refused" is an argument from the version guard, not a
+measurement over stored notes. `docs/COMPAT_REPLAY.md` records which is which.
 
 ## Known, not closed
 
