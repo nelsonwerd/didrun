@@ -10,6 +10,6 @@ A didrun record is a faithful *recording*, not a *proof* — see docs/TRUST_MODE
 The runtime is stdlib-only by design; auditability is the trust wedge.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = ["__version__"]

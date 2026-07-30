@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from didrun import redact
 from didrun import render
-from didrun.claims import GradeResult, Claim
+from didrun.claims import (
+    ENV_DRIFT,
+    ENV_INCOMPARABLE,
+    ENV_MATCH,
+    ENV_NOT_RECORDED,
+    GradeResult,
+    Claim,
+)
 from didrun.gitplumbing import PathChange
 
 
@@ -35,15 +42,20 @@ def test_benign_git_hash_not_flagged():
 
 def test_redact_replaces_with_marker():
     text = "token sk-ABCDEFGHIJKLMNOPQRSTUVWX here"
-    out, findings = redact.redact(text)
-    assert findings
-    assert "sk-ABCDEFGHIJKLMNOPQRSTUVWX" not in out
-    assert "redacted" in out
+    result = redact.redact(text)
+    assert result.findings
+    assert "sk-ABCDEFGHIJKLMNOPQRSTUVWX" not in result.text
+    assert "redacted" in result.text
 
 
 # --- render helpers ----------------------------------------------------------
 
-def _report(results, all_verified=False, worst="stale"):
+def _report(results, all_verified=False, worst="stale", chain="intact",
+            chain_index=None, chain_why="", require_env_match=False):
+    # Bound outside the class body on purpose: a class-body default may not read
+    # a name the class body itself also assigns (LOAD_NAME, not LOAD_CLASSDEREF).
+    gating = require_env_match
+
     @dataclass
     class R:
         commit: str = "abcdef123456"
@@ -52,14 +64,59 @@ def _report(results, all_verified=False, worst="stale"):
         results: list = None
         coverage: dict = None
         secrets_override: bool = False
+        notes_skipped: int = 0
+        # Mirrors VerifyReport's chain fields. Carried as real attributes rather
+        # than left off: render reads them directly, so a surface that starts
+        # depending on a chain state this fake cannot express fails here loudly
+        # instead of silently rendering the default.
+        chain_status: str = chain
+        chain_broken_index: object = chain_index
+        chain_reason: str = chain_why
+        # Mirrors VerifyReport's environment fields, for the same reason.
+        require_env_match: bool = gating
+        # Mirrors VerifyReport's authority block, for the same reason. Empty on
+        # purpose: every surface test in this file renders a report that cited
+        # nothing, which is what pins "an ordinary verdict gains no authority
+        # line". The cited case lives in tests/test_operator_authority.py.
+        authority: list = field(default_factory=list)
 
         @property
         def worst_status(self):
             return worst
 
         @property
+        def env_counts(self):
+            counts = {ENV_MATCH: 0, ENV_DRIFT: 0, ENV_INCOMPARABLE: 0,
+                      ENV_NOT_RECORDED: 0}
+            for r in self.results:
+                counts[r.env_status] = counts.get(r.env_status, 0) + 1
+            return counts
+
+        @property
         def all_verified(self):
             return all_verified
+
+        # Mirrors VerifyReport: a superseded result is record, not verdict, so
+        # both surfaces count the live set and report the retained count
+        # separately. Real GradeResults carry the flag, so the fake derives
+        # these the same way the real report does rather than declaring them.
+        @property
+        def live_results(self):
+            return [r for r in self.results if not r.is_superseded]
+
+        @property
+        def superseded_count(self):
+            return len(self.results) - len(self.live_results)
+
+        # Mirrors VerifyReport: both human surfaces report how many verdicts
+        # were checked against the recorded entry the seal named.
+        @property
+        def evidence_bound_count(self):
+            return sum(1 for r in self.results if r.evidence_bound)
+
+        @property
+        def total(self):
+            return len(self.results)
 
     return R(results=results, coverage={"by_coverage": {"complete": 1}})
 
@@ -90,6 +147,23 @@ def test_cli_no_color_has_text_tokens(monkeypatch):
     # never "VERIFIED" (which would overclaim — the honesty invariant).
     assert "STALE" in out and "TREE-EXACT" in out
     assert "VERIFIED" not in out
+
+
+def test_unparseable_notes_are_reported_on_both_verdict_paths(monkeypatch):
+    """"No manifest" and "there were notes and none could be read" are
+    different facts, and the second must reach the operator on the no-claims
+    path too — that is the path a repo with only foreign notes lands on."""
+    monkeypatch.setenv("NO_COLOR", "1")
+    quiet = render.render_verdict(_report([]))
+    assert "skipped" not in quiet  # never invented when the count is zero
+
+    empty = _report([], worst="empty")
+    empty.notes_skipped = 2
+    assert "2 notes skipped (unparseable)" in render.render_verdict(empty)
+
+    graded = _report([_gr("tree-exact", "t")])
+    graded.notes_skipped = 1
+    assert "1 note skipped (unparseable)" in render.render_verdict(graded)
 
 
 def test_no_surface_says_verified():

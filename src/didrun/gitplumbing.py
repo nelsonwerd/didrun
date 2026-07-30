@@ -142,11 +142,18 @@ def submodule_dirty(repo: Path) -> bool:
 # is stable across repos with different ignore rules.
 LEDGER_DIRNAME = ".didrun"
 
+# Where rotated ledgers are kept. Same argument as the ledger dir, one step
+# later: archiving a ledger is tooling housekeeping, so if the archive root
+# counted, the act of archiving would move the digest and stale the very unit
+# that just archived. This is a digest-SEMANTICS change from v0.1 and only for
+# a repo that carries this directory WITHOUT gitignoring it — see docs/COMPAT.md.
+ARCHIVE_DIRNAME = ".didrun-history"
+
 
 def tree_digest(
     repo: Path,
     ledger_objects: Optional[Path] = None,
-    exclude: tuple[str, ...] = (LEDGER_DIRNAME,),
+    exclude: tuple[str, ...] = (LEDGER_DIRNAME, ARCHIVE_DIRNAME),
 ) -> Optional[str]:
     """Digest the current working tree (staged + unstaged + untracked).
 
@@ -155,7 +162,7 @@ def tree_digest(
     are written into ``ledger_objects`` if given (zero pollution of the user's
     object DB) with the repo's real objects available as an alternate so the
     write-tree can reference existing blobs. ``exclude`` pathspecs are kept out
-    of the digest (the ledger dir by default).
+    of the digest (the ledger dir and the archive root by default).
     """
     if not is_git_repo(repo):
         return None
@@ -221,12 +228,19 @@ class PathChange:
 
 def tree_delta(
     repo: Path, tree_a: str, tree_b: str, ledger_objects: Optional[Path] = None
-) -> list[PathChange]:
+) -> Optional[list[PathChange]]:
     """Exact path-level delta between two tree objects.
 
     Requires that both trees' objects are reachable — the ledger's redirected
     objects plus the repo's own. This is what turns "stale" from a shrug into a
     measured statement ("stale: 1 line changed in src/foo.py").
+
+    Two return values that must never be conflated: ``[]`` means *computed, and
+    the trees are equal*; ``None`` means *not computable* — git failed, so
+    nothing at all is known about the difference. Returning ``[]`` on failure
+    (v0.1 did) lets the caller render "0 path(s) differ" and "evidence tree
+    equals sealed tree" as facts derived from a subprocess that failed, which
+    is exactly the archived-ledger case where the evidence objects are gone.
     """
     env = {}
     if ledger_objects is not None:
@@ -239,7 +253,7 @@ def tree_delta(
         check=False,
     )
     if proc.returncode != 0:
-        return []
+        return None
     changes: list[PathChange] = []
     for line in proc.stdout.splitlines():
         parts = line.split("\t")

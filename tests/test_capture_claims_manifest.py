@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from didrun import capture
+from didrun import cli
 from didrun.ledger import Session
 from didrun.capture import run_wrapped
 from didrun.claims import Claim, ClaimError, grade
@@ -194,3 +198,143 @@ def test_strict_nonzero_on_stale(repo: Path):
     M.seal(s, repo)
     report = M.verify(s, repo)
     assert not report.all_verified  # → CLI --strict returns nonzero
+
+
+# --- P0.3: the format contract ------------------------------------------------
+
+def _note_body(version: int, tree: str, commit: str = "0" * 40) -> bytes:
+    """A structurally complete note body at an arbitrary manifest version."""
+    return json.dumps(
+        {
+            "version": version,
+            "commit": commit,
+            "tree": tree,
+            "claims": [],
+            "coverage": {"total_events": 0, "by_coverage": {}},
+            "secrets_override": False,
+        }
+    ).encode("ascii")
+
+
+def _attach_raw_note(repo: Path, commit: str, body: bytes) -> None:
+    """Publish arbitrary bytes as a note, bypassing Manifest entirely."""
+    subprocess.run(
+        ["git", "notes", f"--ref={M.NOTES_REF}", "add", "-f", "-F", "-", commit],
+        cwd=str(repo),
+        input=body,
+        capture_output=True,
+        check=True,
+    )
+
+
+def _note_of(repo: Path, commit: str):
+    """The note attached to ``commit``, or None — read with raw git, not didrun."""
+    proc = subprocess.run(
+        ["git", "notes", f"--ref={M.NOTES_REF}", "show", commit],
+        cwd=str(repo),
+        capture_output=True,
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _commit_file(repo: Path, name: str) -> str:
+    """A commit with a tree distinct from every other commit in the fixture."""
+    (repo / name).write_text(f"content of {name}\n")
+    _git(repo, "add", name)
+    _git(repo, "commit", "-qm", f"add {name}")
+    return gp.head_commit(repo)
+
+
+def test_from_json_refuses_a_newer_manifest_version(repo: Path):
+    """Refuse, never coerce: a v99 note may have redefined a field this binary
+    reads, so grading it under v1 semantics would be a confident lie."""
+    with pytest.raises(M.ManifestError) as exc:
+        M.Manifest.from_json(_note_body(99, "a" * 40))
+    msg = str(exc.value)
+    assert "version 99" in msg          # the version it met
+    assert f"max {M.MANIFEST_VERSION}" in msg   # the version it understands
+    assert "upgrade didrun" in msg
+
+
+def test_from_json_accepts_the_current_manifest_version():
+    """The gate is `>`, not `!=` — every note already published is version 1."""
+    m = M.Manifest.from_json(_note_body(M.MANIFEST_VERSION, "b" * 40))
+    assert m.version == M.MANIFEST_VERSION
+    assert m.tree == "b" * 40
+
+
+def test_fallback_skips_an_unparseable_note_and_counts_it(repo: Path):
+    """A foreign or corrupt note under the same ref must not hide every good
+    one — but the skip is counted, never silently reported as "no manifest"."""
+    stranger = gp.head_commit(repo)
+    target = _commit_file(repo, "target.py")
+    _attach_raw_note(repo, stranger, b"not json")
+    assert _note_of(repo, target) is None  # the commit-exact path finds nothing
+
+    manifest, resolved_by, skipped = M._resolve_manifest(
+        repo, target, gp.commit_tree(repo, target)
+    )
+    assert manifest is None and resolved_by == "none"
+    assert skipped == 1
+    assert M.verify(_session(repo), repo, commitish=target).notes_skipped == 1
+
+
+def test_fallback_refuses_a_future_version_it_scans_past(repo: Path):
+    """Fail closed on the version even in the fallback loop, and do it
+    order-independently: NEITHER note's tree matches the commit under test, so
+    the loop cannot exit early on a match and must reach the v99 note whichever
+    order `git notes list` yields."""
+    garbage_commit = gp.head_commit(repo)
+    future_commit = _commit_file(repo, "future.py")
+    target = _commit_file(repo, "target.py")
+
+    target_tree = gp.commit_tree(repo, target)
+    future_tree = gp.commit_tree(repo, future_commit)
+    assert future_tree != target_tree  # the fixture's whole point
+
+    _attach_raw_note(repo, garbage_commit, b"not json")
+    _attach_raw_note(repo, future_commit, _note_body(99, future_tree, future_commit))
+    assert _note_of(repo, target) is None  # commit-exact found nothing first
+
+    with pytest.raises(M.ManifestError) as exc:
+        M._resolve_manifest(repo, target, target_tree)
+    assert "version 99" in str(exc.value)
+
+
+def test_cli_refuses_a_future_note_as_a_message_not_a_traceback(repo: Path, capsys):
+    """Fail-closed has to reach the operator as a refusal. A traceback is a
+    crash report, and a CI log full of stack frames reads as "didrun is broken"
+    rather than "this note was written by a newer didrun". Exit 2, not
+    --strict's 1: unreadable evidence is a different fact from bad evidence."""
+    head = gp.head_commit(repo)
+    _attach_raw_note(repo, head, _note_body(99, gp.commit_tree(repo, head), head))
+    rc = cli.main(["--repo", str(repo), "verify", "--strict"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "version 99" in err and "upgrade didrun" in err
+    assert "Traceback" not in err
+
+
+def test_env_fingerprint_carries_its_version_in_band():
+    # The shape is pinned in tests/test_env_fingerprint.py, which owns the v2
+    # contract; what this asserts is that the version is READABLE off the wire
+    # and that an unversioned v0.1 digest still reports as unversioned.
+    assert capture.fingerprint_version(capture.env_fingerprint({"PATH": "/bin"})) == 2
+    assert capture.fingerprint_version("v1:0123456789abcdef") == 1
+    # A bare v0.1 digest: incomparable with a versioned one, not drifted.
+    assert capture.fingerprint_version("0123456789abcdef") is None
+
+
+def test_env_fingerprint_is_deterministic_and_env_sensitive():
+    """Determinism is a trust-path invariant; sensitivity is the point of the
+    field. No hard-coded digest — the key set has changed once already."""
+    env = {"PATH": "/usr/bin", "SHELL": "/bin/zsh", "LANG": "C"}
+    assert capture.env_fingerprint(env) == capture.env_fingerprint(dict(env))
+    assert capture.env_fingerprint({**env, "SHELL": "/bin/bash"}) != capture.env_fingerprint(env)
+
+
+def test_recorded_events_carry_the_versioned_fingerprint(repo: Path):
+    """The prefix reaches the ledger, not just the helper's return value."""
+    s = _session(repo)
+    ev = run_wrapped([sys.executable, "-c", "print(1)"], s, repo)
+    assert capture.fingerprint_version(ev.env_fingerprint) == 2
