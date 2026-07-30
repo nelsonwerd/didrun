@@ -275,13 +275,10 @@ _README = Path(__file__).resolve().parents[1] / "README.md"
 # below is what forces the edit.
 _REMOVED_CLAIM = "secrets are redacted from every export"
 _REPLACEMENT = (
-    "Redaction covers the sealed note: every exported claim string — the "
-    "`argv_preview`, the label, the pathspecs, the changed paths, the conjuncts "
-    "and the reason — is redacted, and the projection is declared in the manifest."
+    'Redaction covers the sealed note — every exported claim string (`argv_preview`, label, pathspecs, changed paths, conjuncts, reason) is redacted by the same pass that reports findings to the gate, and the projection is declared in the manifest.'
 )
 _CAVEAT = (
-    "a stale claim's file list is recomputed against your working tree at "
-    "verify time and is shown as it is on disk"
+    "a stale claim's file list is recomputed against your working tree at verify time and shown as it is on disk"
 )
 
 
