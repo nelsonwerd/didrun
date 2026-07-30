@@ -201,13 +201,13 @@ outright rather than being ignored. The rest:
 **What v0.2 did not establish.** Compatibility with evidence already sealed is **not** a
 finding: the compat harness is content-blind and green on synthetic fixtures only, the
 real archive replay has never run, and the harness prints `corpus: SKIPPED (unverified)`
-rather than let a green line imply otherwise. And two
-operational errors still escape as Python tracebacks with exit **1** instead of the graded
-refusal with exit 2 that the same binary gives elsewhere: a command that does not exist,
-and a `session.log` this binary cannot parse (which takes `run`, `verify` and
-`show --session` down alike). Exit 1 is `--strict`'s "graded badly" code, so a crash is
-not distinguishable by exit status from an honest failure.
-[docs/V02_STATUS.md](docs/V02_STATUS.md) separates verified from bet, item by item.
+rather than let a green line imply otherwise. And two operational errors still escape as
+Python tracebacks with exit **1** instead of the graded refusal with exit 2 that the same
+binary gives elsewhere: a command that does not exist, and a `session.log` this binary
+cannot parse (which takes `run`, `verify` and `show --session` down alike). Exit 1 is
+`--strict`'s "graded badly" code, so a crash is not distinguishable by exit status from
+an honest failure. [docs/V02_STATUS.md](docs/V02_STATUS.md) separates verified from bet,
+item by item.
 
 > **Upgrading: verifiers before sealers.** `MANIFEST_VERSION` is now **3**, and an older
 > reader **refuses** a v0.2 note by design — exit 2, `manifest version N is newer than
