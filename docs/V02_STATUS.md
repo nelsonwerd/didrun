@@ -143,12 +143,12 @@ gate is unverified code in a release. Each of these is a small, self-contained u
   So a future ledger format reads to the operator as **tamper**, which is precisely the false alarm the
   frozen preimage was built to prevent.
 
-- **K3 — `didrun --version` still prints `0.1.0`.** The entire forward-compatibility story in
-  `docs/COMPAT.md` is phrased as "a v0.1 reader versus a v0.2 reader" and instructs operators to *upgrade
-  the verifier before the sealer* — and the only way anyone can tell which they have is `--version`.
-  **This must not ship as 0.1.0.** It is not fixed here only because `src/didrun/**` was fenced off for
-  this pass; it is a two-line change (`pyproject.toml`, `src/didrun/__init__.py`) with no test depending on
-  the string.
+- **K3 — CLOSED after the integration pass.** `didrun --version` printed `0.1.0`, which was
+  self-defeating: the forward-compatibility story in `docs/COMPAT.md` is phrased as "a v0.1 reader versus
+  a v0.2 reader" and instructs operators to *upgrade the verifier before the sealer*, and `--version` is
+  the only way anyone can tell which they have. Now `0.2.0` in `pyproject.toml` and
+  `src/didrun/__init__.py`. It was outstanding at the end of the integration pass only because that pass
+  fenced off `src/didrun/**` by design, not because the change was in doubt.
 
 - **K4 — the happy path shouts.** The first seal of every session prints a four-line `WARNING` about
   having no watermark file, a condition the warning itself then explains is *"correct for a session's first
