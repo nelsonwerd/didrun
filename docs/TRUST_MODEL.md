@@ -31,7 +31,7 @@ ran it or whether it mattered.**
 | Grade | Attests | Does NOT attest |
 |-------|---------|-----------------|
 | `tree-exact` | A self-stable command ran against exactly the sealed tree. | That the command tested anything meaningful, or that the code is correct. |
-| `scope-exact` | Every change since the evidence is inside claimant-declared pathspecs. | That the declared pathspecs are the *right* scope — the claimant chose them. |
+| `scope-exact` | Every change since the evidence is inside claimant-declared path prefixes (`claim --path`). | That the declared prefixes are the *right* scope — the claimant chose them. |
 | `stale` | Evidence exists; here is the exact delta between it and the sealed tree. | Nothing beyond "the tree moved" — the reviewer judges whether the delta matters. |
 | `unknown` | We could not honestly bind evidence to this claim. | That the claim is false — only that it is unbacked. |
 | `failed` | The command backing this claim was *recorded exiting nonzero* — evidence against the claim, not merely absent evidence. | Anything about intent. A recorded failure is a fact about a process's exit code, never a statement about who ran it or why. |

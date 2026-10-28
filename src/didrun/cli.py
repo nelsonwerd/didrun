@@ -23,7 +23,7 @@ from .capture import (
     run_wrapped,
     signal_name,
 )
-from .claims import CLAIM_TYPES, CONJUNCTION, Claim
+from .claims import CLAIM_TYPES, CONJUNCTION, Claim, pathspec_problem
 from . import manifest as _manifest
 from . import redact
 from . import render
@@ -93,6 +93,13 @@ def cmd_claim(args) -> int:
         return 2
     conjuncts: tuple = ()
     indices: tuple = ()
+    # Before anything is bound: a pathspec `_within` cannot honour would make the
+    # claim's scope silently empty, so it is refused here rather than declared.
+    for spec in args.path or ():
+        problem = pathspec_problem(spec)
+        if problem is not None:
+            print(f"didrun claim: --path {problem}", file=sys.stderr)
+            return 2
     if args.type == CONJUNCTION:
         # A conjunction binds no event — it conjoins claims that carry their own
         # witnessed events — so the "most recent event did not exit 0" refusal
@@ -462,7 +469,22 @@ def build_parser() -> argparse.ArgumentParser:
             "rather than bound to an earlier one when that event did not exit 0"
         ),
     )
-    pc.add_argument("--path", action="append", help="declare a pathspec for scope-exact grading")
+    pc.add_argument(
+        "--path",
+        action="append",
+        metavar="PREFIX",
+        help=(
+            "a repository-relative path prefix (a directory such as 'src/', or one "
+            "file) inside which the sealed commit may differ from the tree this "
+            "claim's evidence was recorded against — including files the claimed "
+            "run itself wrote — and still grade scope-exact. Any difference "
+            "outside every declared prefix grades stale, and the reason names "
+            "the --path that would cover it. Repeat --path to declare several. "
+            "Plain prefixes only: git pathspec magic (':(exclude)…', ':!…') and "
+            "globs are refused, not interpreted. You choose the scope; didrun "
+            "never judges whether it is the right one"
+        ),
+    )
     pc.add_argument(
         "--of",
         metavar="LABEL[,LABEL…]",

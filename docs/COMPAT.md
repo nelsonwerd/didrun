@@ -455,6 +455,19 @@ and `verify` regrades with the binary that runs it, so this reaches notes alread
   recorded used to be graded on the tree it left alone; what it ran against is unknown,
   so the claim now says exactly that.
 
+## `claim --path` refuses what a prefix match cannot honour (behaviour, not format)
+
+A declared pathspec has always been matched as a **path prefix** and nothing else. After
+v0.2.0, `didrun claim` refuses (exit 2, nothing written) every form that matching reads as
+a literal prefix covering nothing: git pathspec magic (`:(exclude)docs/x.md`, `:!…`,
+`:/…`), globs (`*`, `?`, `[`), the whole repository (`""`, `.`, `/`, `./`), a leading
+`./`, and a `.` or `..` segment. Each used to be accepted and to make the claim's scope
+silently empty, so every change graded `stale` with no word about why. Exclude pathspecs
+are refused rather than supported on purpose: "everything but this file is in scope" is
+the most generous reading a flag that exists to be narrow could get. A note that already
+carries such a pathspec is not affected — it parses and grades exactly as it did, because
+the check runs at declaration only.
+
 ## Ledger permissions (v0.2) and where the guarantee stops
 
 v0.2 forces the ledger ROOT to `0700` on every writable open — creation and re-open

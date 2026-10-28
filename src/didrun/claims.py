@@ -711,6 +711,57 @@ def _widening_hint(paths) -> str:
     return f"add {hint} to make this scope-exact"
 
 
+_GLOB_CHARS = "*?["
+
+
+def pathspec_problem(spec: str) -> Optional[str]:
+    """Why ``spec`` cannot be a declared pathspec, or None if it can.
+
+    ``_within`` is a path-prefix test and nothing else. Every form refused here
+    is one it would read as a literal prefix matching nothing — so the claim's
+    scope would be silently empty, every change would grade stale, and nothing
+    would say why. Found with ``--path ':(exclude)docs/x.md'``, which an
+    operator reading "pathspec" reasonably took for a git pathspec.
+
+    Refused, never interpreted. An exclude pathspec would mean "everything but
+    this is in scope", the most generous reading of a flag that exists to be
+    narrow; a glob would make scope a pattern match no reviewer can check at a
+    glance. Called at DECLARATION only: a note already carrying such a pathspec
+    still parses and grades as it did, because refusing to read published
+    evidence is worse than the empty scope it already has.
+    """
+    stripped = spec.strip("/")
+    if spec.startswith(":"):
+        return (
+            f"{spec!r} is git pathspec magic, which --path does not interpret "
+            f"(it would cover nothing); declare the plain path prefixes that ARE "
+            f"in scope instead"
+        )
+    if any(ch in spec for ch in _GLOB_CHARS):
+        return (
+            f"{spec!r} contains a glob character, which --path does not expand "
+            f"(it would cover nothing); declare a directory prefix such as 'src/'"
+        )
+    if stripped in ("", "."):
+        return (
+            f"{spec!r} names the whole repository, which would put every change "
+            f"in scope and make scope-exact say nothing"
+        )
+    if stripped.startswith("./"):
+        return (
+            f"{spec!r} has a leading ./, which a prefix match never strips (it "
+            f"would cover nothing); write it repository-relative, e.g. "
+            f"{stripped[2:]!r}"
+        )
+    if any(part in (".", "..") for part in stripped.split("/")):
+        return (
+            f"{spec!r} contains a '.' or '..' segment, which a prefix match "
+            f"never resolves (it would cover nothing); write the normalized "
+            f"repository-relative path"
+        )
+    return None
+
+
 def _within(path: str, pathspecs: tuple[str, ...]) -> bool:
     """True if ``path`` is under any declared pathspec (prefix match).
 
