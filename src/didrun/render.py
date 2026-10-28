@@ -200,6 +200,22 @@ def superseded_text(report) -> str:
     )
 
 
+def deferred_text(report) -> str:
+    """One line for the claims the operator set aside, or "" when there are none.
+
+    On the same terms as ``superseded_text``: absent when zero, and saying
+    exactly what a deferral is. Without a count, `claim --defer` would be a way
+    to make a red row disappear; with one, it is a stated, visible exclusion.
+    """
+    count = report.deferred_count
+    if not count:
+        return ""
+    return (
+        f"{count} claim{'' if count == 1 else 's'} deferred out of this commit "
+        f"(retained in the record, excluded from the verdict)"
+    )
+
+
 # The token for a bound authority. Deliberately NOT a row in `_GRADE_DISPLAY` or
 # `_SORT_RANK`: `cited` is an AUTHORITY's grade and never a claim's. No
 # GradeResult carries it, `worst_status` never returns it, and a `_SORT_RANK` row
@@ -287,7 +303,7 @@ def _conjunct_token(grade) -> str:
     return _GRADE_DISPLAY.get(grade, ("UNKNOWN", "33", "?", ""))[0]
 
 
-def _row_detail(r, reason: str) -> str:
+def _row_detail(r, reason: str, text=None) -> str:
     """The detail cell text, prefixed when the row is record rather than verdict.
 
     Without this a retired FAILED row still reads FAILED under an ALL
@@ -295,9 +311,14 @@ def _row_detail(r, reason: str) -> str:
     grade and reason are NOT rewritten — that is the whole point of keeping the
     entry — so the marker goes in front of them.
     """
-    if not r.is_superseded:
-        return reason
-    return f"superseded by claim #{r.superseded_by} (record, not verdict) — {reason}"
+    if r.is_superseded:
+        return f"superseded by claim #{r.superseded_by} (record, not verdict) — {reason}"
+    if r.is_deferred:
+        # The deferral reason is the operator's text, out of the note: made safe
+        # for the surface by the caller's own function, like ``reason`` was.
+        why = (text or _sanitize)(r.deferred)
+        return f"deferred (record, not verdict): {why} — {reason}"
+    return reason
 
 
 def render_verdict(report, width: int = 80) -> str:
@@ -307,7 +328,8 @@ def render_verdict(report, width: int = 80) -> str:
     # record of how the unit got here, and the live claims are what a reviewer
     # is being asked about.
     results = sorted(
-        report.results, key=lambda r: (r.is_superseded, _SORT_RANK.get(r.grade, 9))
+        report.results,
+        key=lambda r: (r.is_superseded or r.is_deferred, _SORT_RANK.get(r.grade, 9)),
     )
     banner = render_chain_banner(report)
 
@@ -348,6 +370,9 @@ def render_verdict(report, width: int = 80) -> str:
     superseded = superseded_text(report)
     if superseded:
         lines.append(f"  {superseded}")
+    deferred = deferred_text(report)
+    if deferred:
+        lines.append(f"  {deferred}")
     lines.append(f"  {env_summary_text(report)}")
     if report.secrets_override:
         lines.append(_c("  ! sealed with --allow-secrets (redacted export)", "33"))
@@ -405,7 +430,8 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     print-clean. This is the shareable evidence surface.
     """
     results = sorted(
-        report.results, key=lambda r: (r.is_superseded, _SORT_RANK.get(r.grade, 9))
+        report.results,
+        key=lambda r: (r.is_superseded or r.is_deferred, _SORT_RANK.get(r.grade, 9)),
     )
     live = report.live_results
     verified = sum(1 for r in live if r.grade in ("tree-exact", "scope-exact"))
@@ -420,11 +446,11 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     for r in results:
         token, _color, _marker, _gloss = _GRADE_DISPLAY.get(r.grade, ("UNKNOWN", "", "?", ""))
         grade_class = r.grade.replace("-", "_")
-        if r.is_superseded:
+        if r.is_superseded or r.is_deferred:
             # A second class, not a replaced one: the row keeps the grade it
             # earned (that is the record) and the tone says it does not vote.
             grade_class += " superseded"
-        detail = _row_detail(r, esc(r.reason))
+        detail = _row_detail(r, esc(r.reason), esc)
         exit_txt = f"exit {r.exit_code}" if r.exit_code is not None else "—"
         argv = " ".join(r.claim.get("argv_preview", [])) if isinstance(r.claim, dict) else ""
         # The conjunct list rides in the detail column, above the delta: a
@@ -473,6 +499,9 @@ def render_html(report, title: str = "didrun evidence report") -> str:
     )
     superseded = superseded_text(report)
     superseded_html = f"{esc(superseded)} ·" if superseded else ""
+    deferred = deferred_text(report)
+    if deferred:
+        superseded_html += f" {esc(deferred)} ·"
 
     # One block per cited authority, above the table for the same reason as the
     # chain sentence: it is a statement about the seal, not about a claim, so a

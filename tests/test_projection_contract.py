@@ -273,9 +273,12 @@ _README = Path(__file__).resolve().parents[1] / "README.md"
 # enumerating what is actually covered — a list that goes stale in the
 # understating direction is the same defect in a quieter key, and the assertion
 # below is what forces the edit.
+#
+# And again with `claim --defer`: a deferred claim's entry publishes the
+# operator's reason, redacted as `deferred.reason` (tests/test_claim_deferral.py).
 _REMOVED_CLAIM = "secrets are redacted from every export"
 _REPLACEMENT = (
-    'Redaction covers the sealed note — every exported claim string (`argv_preview`, label, pathspecs, changed paths, conjuncts, reason) is redacted by the same pass that reports findings to the gate, and the projection is declared in the manifest.'
+    'Redaction covers the sealed note — every exported claim string (`argv_preview`, label, pathspecs, changed paths, conjuncts, reason, deferral reason) is redacted by the same pass that reports findings to the gate, and the projection is declared in the manifest.'
 )
 _CAVEAT = (
     "a stale claim's file list is recomputed against your working tree at verify time and shown as it is on disk"

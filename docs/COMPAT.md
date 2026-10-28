@@ -455,6 +455,32 @@ and `verify` regrades with the binary that runs it, so this reaches notes alread
   recorded used to be graded on the tree it left alone; what it ran against is unknown,
   so the claim now says exactly that.
 
+## A claim can be deferred out of a seal's verdict
+
+After v0.2.0, `didrun claim --defer LABEL --reason TEXT` sets one live, unsealed claim
+aside from the next seal's verdict (docs/TRUST_MODEL.md, *Deferral*). Two additions carry
+it, neither of which bumps `MANIFEST_VERSION`:
+
+- **A new ledger file, `.didrun/deferrals.jsonl`**, one canonical-JSON record per line:
+  `claim_index` (into `claims.jsonl`), `ctype`, `label`, `reason`, `declared_at_event`.
+  It is a separate file on purpose: an older binary loads every line of `claims.jsonl`
+  as a claim and would raise on a record that is not one, while it ignores a file it does
+  not know. A record whose index is outside the window being sealed, whose claim no
+  longer carries that `(ctype, label)`, or that does not parse, defers nothing.
+- **An additive claim-entry key, `deferred: {"reason": …}`**, written only on an entry the
+  seal honoured the deferral for, and read with `.get()`. The reason is redacted like
+  every other operator-authored field, under the field name `deferred.reason`. `verify`
+  reads the mark the way it reads `superseded_by` — validated: a mark that is not an
+  object with a non-empty string reason, a mark on a retired entry, and a mark on an entry
+  that grades `failed` are all dropped, and the claim counts.
+
+**What an older verifier does with it.** A v0.2.0 reader does not know the key, so it
+counts a deferred claim toward the verdict — the stricter reading, never a more generous
+one. A note that defers nothing verifies identically under both. That asymmetry is why
+there is no version bump: bumping would make every older verifier refuse every new note
+outright, including the ones that use no deferral at all. **Verifiers before sealers**
+still holds — a CI pinned to v0.2.0 will fail a note whose seal deferred a stale claim.
+
 ## `claim --path` refuses what a prefix match cannot honour (behaviour, not format)
 
 A declared pathspec has always been matched as a **path prefix** and nothing else. After

@@ -102,11 +102,17 @@ def _report(results, all_verified=False, worst="stale", chain="intact",
         # these the same way the real report does rather than declaring them.
         @property
         def live_results(self):
-            return [r for r in self.results if not r.is_superseded]
+            return [r for r in self.results if not (r.is_superseded or r.is_deferred)]
 
         @property
         def superseded_count(self):
-            return len(self.results) - len(self.live_results)
+            return sum(1 for r in self.results if r.is_superseded)
+
+        # Mirrors VerifyReport: an operator's deferral is record, not verdict,
+        # counted apart from supersession (tests/test_claim_deferral.py).
+        @property
+        def deferred_count(self):
+            return sum(1 for r in self.results if r.is_deferred and not r.is_superseded)
 
         # Mirrors VerifyReport: both human surfaces report how many verdicts
         # were checked against the recorded entry the seal named.

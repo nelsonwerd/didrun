@@ -84,9 +84,64 @@ def _conjunct_labels(raw: Optional[str]) -> tuple:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
+def _cmd_defer(args, session: Session) -> int:
+    """`claim --defer LABEL --reason TEXT`: set one unsealed claim aside.
+
+    It declares nothing, so every flag that shapes a declaration is refused
+    rather than ignored — an operator who passed one meant something by it.
+    """
+    shaping = [
+        flag
+        for flag, value in (
+            ("--event", args.event),
+            ("--path", args.path),
+            ("--of", args.of),
+            ("--label", args.label),
+        )
+        if value is not None
+    ]
+    if shaping:
+        print(
+            f"didrun claim: --defer sets an existing claim aside and declares no "
+            f"claim, so {', '.join(shaping)} has nothing to apply to",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        record = _manifest.declare_deferral(
+            session, args.defer, args.reason or "", ctype=args.type
+        )
+    except _manifest.ManifestError as exc:
+        print(f"didrun claim: {exc}", file=sys.stderr)
+        return 2
+    text = render.sanitize_text
+    print(
+        f"deferred claim #{record['position']} {record['ctype']} "
+        f"({text(record['label'])}) out of the next seal's verdict: "
+        f"{text(record['reason'])}"
+    )
+    print(
+        "  it stays in the note as record — graded, published with this reason, "
+        "and counted on every verdict surface"
+    )
+    return 0
+
+
 def cmd_claim(args) -> int:
     repo = Path(args.repo or os.getcwd())
     session = _session(repo)
+    if args.defer is not None:
+        return _cmd_defer(args, session)
+    if args.reason is not None:
+        print("didrun claim: --reason only goes with --defer", file=sys.stderr)
+        return 2
+    if args.type is None:
+        print(
+            "didrun claim: a claim type is required (or --defer LABEL to set a "
+            "claim aside)",
+            file=sys.stderr,
+        )
+        return 2
     events = session.events()
     if not events:
         print("didrun claim: no recorded events to bind to (run something first)", file=sys.stderr)
@@ -261,7 +316,10 @@ def cmd_seal(args) -> int:
     # recorded-exact" for a unit `verify` calls ALL RECORDED-EXACT, and the two
     # numbers describing the same note have to describe the same set.
     live = _manifest.live_claims(m.claims)
-    superseded = len(m.claims) - len(live)
+    # The two kinds of record-not-verdict entry, counted apart: a retired retry
+    # and an operator's deferral are different facts about the window.
+    deferred = len(_manifest.deferred_claims(m.claims))
+    superseded = len(m.claims) - len(live) - deferred
     verified = sum(1 for c in live if c["grade"] in ("tree-exact", "scope-exact"))
     # The tier split is reported even when nothing blocked: "0 findings" and
     # "12 findings, none of them blocking" are different facts about the same
@@ -273,6 +331,7 @@ def cmd_seal(args) -> int:
         f"sealed manifest for {m.commit[:12]} (tree {m.tree[:12]})  "
         f"{verified}/{len(live)} claims recorded-exact  "
         + (f"{superseded} superseded  " if superseded else "")
+        + (f"{deferred} deferred  " if deferred else "")
         + f"{blocking + noticed} findings ({blocking} block / {noticed} notice)"
         + ("  [--allow-secrets]" if m.secrets_override else "")
     )
@@ -458,7 +517,15 @@ def build_parser() -> argparse.ArgumentParser:
     # Read from the vocabulary rather than repeated here. The two lists were
     # duplicates, and a duplicate of a closed vocabulary drifts silently: the CLI
     # would keep refusing a type the library had accepted for a release.
-    pc.add_argument("type", choices=list(CLAIM_TYPES))
+    pc.add_argument(
+        "type",
+        nargs="?",
+        choices=list(CLAIM_TYPES),
+        help=(
+            "the claim type to declare. With --defer it is optional and only "
+            "chooses between live claims that share a label"
+        ),
+    )
     pc.add_argument("--label", help="human label (default: the type)")
     pc.add_argument(
         "--event",
@@ -494,6 +561,25 @@ def build_parser() -> argparse.ArgumentParser:
             "them and can never be better than any one of them; a label that "
             "names no single live claim in the window grades it unknown"
         ),
+    )
+    pc.add_argument(
+        "--defer",
+        metavar="LABEL",
+        help=(
+            "set the live, UNSEALED claim with this label aside from the next "
+            "seal's verdict, because it belongs to work that is not in this "
+            "commit (an interrupted unit's draft, say). It declares no claim. "
+            "The claim stays in the note as record — graded, published with "
+            "--reason, and counted on every verdict surface — and is bound to "
+            "that one claim, not the label: re-declaring the gate makes a "
+            "claim that votes. A claim bound to a command that exited nonzero "
+            "is refused: deferral never sets a witnessed failure aside"
+        ),
+    )
+    pc.add_argument(
+        "--reason",
+        metavar="TEXT",
+        help="with --defer (required there): why, published in the note",
     )
     pc.set_defaults(func=cmd_claim)
 

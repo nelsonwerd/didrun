@@ -60,9 +60,38 @@ would attest nothing. A run whose starting tree was not recorded grades `unknown
 |-------|--------------------------|----------------------|
 | **Lazy agent** (claims without running) | The claim grades `unknown` — no witnessed success. | — |
 | **Agent that runs, then edits** | The claim grades `stale` with the exact delta. | — |
+| **Agent that defers its way to green** | `claim --defer` refuses a claim bound to a command that exited nonzero, and seal and verify re-check the grade. A deferred claim stays in the note, graded, with its reason, and is counted on every surface. | Deferring a `stale` or `unknown` claim that really does belong to the commit. The reason is the agent's own text; didrun records it and does not judge it. |
 | **Honest mistake** (partial/truncated ledger) | The hash chain breaks. From v0.2 `verify` checks it *before* grading anything and the fault dominates the verdict, so `--strict` refuses; `show --session` reports it too. | A fault in a ledger `seal` is writing to — `seal` does not consult the chain, so sealing over a broken one is possible. |
 | **Developer massaging their own receipts** | Accidental edits break the chain. From v0.2, a note whose bound entry the live ledger cannot supply grades `witness-unavailable` and `--strict` refuses it, so a substituted or rebuilt ledger no longer regrades green. | A deliberate local rebuild of the chain — it is regenerable, and `claim` + `seal` can then mint fresh hash-bound claims. |
 | **Stranger sending forged evidence** | — | Everything. Unsigned local evidence is self-attested; do not trust a stranger's ledger. Cross-party trust needs signing (deferred). |
+
+## Deferral: what `claim --defer` sets aside
+
+A seal covers every claim declared since the last seal. That is right for a unit that
+commits what it claimed, and wrong for one that did not: an interrupted unit's claim over
+draft work rides into the next, unrelated seal and grades `stale` against a commit that
+never contained the draft. The grade is correct; the claim is in the wrong window.
+
+`didrun claim --defer LABEL --reason TEXT` lets the operator say so, and it is shaped by
+the same rule as supersession — **it subtracts from the verdict, never from the record**:
+
+- **What it records.** That someone set this one claim aside from the next seal's
+  verdict, with this reason. The claim is still graded and published with its grade,
+  reason and delta; its entry carries `deferred: {reason}`; every surface counts it.
+- **What it does not attest.** That the claim really belongs to other work. The reason is
+  the operator's text, redacted for secrets and otherwise published as written; didrun
+  cannot check it, exactly as it cannot check that a declared scope is the right one.
+- **The one refusal.** A claim bound to a command that exited nonzero is never set aside.
+  A witnessed failure is evidence *against* a claim, and deferring it would be the
+  cheapest path to green there is — so `--defer` refuses it, and `seal` and `verify`
+  re-check the grade, because the record file and the note can both be edited by hand.
+- **Narrow by construction.** It binds one claim instance in the unsealed window, never a
+  label going forward and never a claim already sealed into a published note. It does
+  not carry the claim into a later window: that unit re-runs and re-claims in its own.
+
+What it buys is the same bound supersession states: setting claims aside until a verdict
+goes green is not *prevented*, it is *visible* — in the note, in the count, with a reason
+a reviewer can read.
 
 ## Why signing is deferred (and it is a bet)
 

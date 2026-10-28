@@ -41,6 +41,7 @@ from .claims import (
     ENV_INCOMPARABLE,
     ENV_MATCH,
     ENV_NOT_RECORDED,
+    GRADE_FAILED,
     GRADE_ORDER_WORST_FIRST,
     GRADE_WITNESS_UNAVAILABLE,
     Claim,
@@ -415,10 +416,39 @@ def seal(
             continue
         results[i] = grade(claim, tree, events, repo, ledger_objects)
     superseded = _supersession(new_claims)
+    # Deferrals the operator recorded for this window (`claim --defer`). A
+    # retired claim needs none, and a FAILED one is never set aside: the record
+    # could have been written by hand, so the grade is checked here and not only
+    # at declaration. Conjunctions are decided after pass two, once graded.
+    requested = _window_deferrals(session, all_claims, watermark)
+    deferred: dict = {}
+
+    def _honour(i: int) -> None:
+        if i not in requested or i in superseded:
+            return
+        if results[i].grade == GRADE_FAILED:
+            print(
+                f"didrun seal: WARNING: the deferral of claim #{i} "
+                f"({new_claims[i].ctype}) is not honoured: it graded failed, and "
+                f"a witnessed failure is never set aside — it counts toward this "
+                f"verdict",
+                file=sys.stderr,
+            )
+            return
+        deferred[i] = requested[i]
+
+    for i, r in enumerate(results):
+        if r is not None:
+            _honour(i)
     # The retired attempts are dropped from the pool here rather than marked on
     # the result: `superseded_by` on a GradeResult is verify-side, and the seal
-    # holds the authoritative mapping already.
-    siblings = [r for i, r in enumerate(results) if r is not None and i not in superseded]
+    # holds the authoritative mapping already. Deferred claims likewise: they
+    # are not part of this commit, so no live conjunction may resolve to one.
+    siblings = [
+        r
+        for i, r in enumerate(results)
+        if r is not None and i not in superseded and i not in deferred
+    ]
     for i in conjunctions:
         # A retired conjunction is graded as the record of its own declaration,
         # against the claims standing THEN; the live one against the window as
@@ -432,6 +462,8 @@ def seal(
         results[i] = grade(
             new_claims[i], tree, events, repo, ledger_objects, siblings=siblings
         )
+    for i in conjunctions:
+        _honour(i)
 
     _gc_durable_copy(session, results)
 
@@ -455,7 +487,12 @@ def seal(
     # (the label bug) or published-but-unscanned, because one pass does both.
     redacted = [
         _redact_result(
-            r, session, entries, claim_index=i, superseded_by=superseded.get(i)
+            r,
+            session,
+            entries,
+            claim_index=i,
+            superseded_by=superseded.get(i),
+            deferred=deferred.get(i),
         )
         for i, r in enumerate(results)
     ]
@@ -586,7 +623,16 @@ class VerifyReport:
         same seal window retired. It stays in ``results``, keeps its grade and
         reason verbatim, and renders; it just does not vote.
         """
-        return [r for r in self.results if not r.is_superseded]
+        return [r for r in self.results if not (r.is_superseded or r.is_deferred)]
+
+    @property
+    def deferred_count(self) -> int:
+        """How many results the operator set aside from this commit's verdict.
+
+        Record, not verdict, like a superseded result — and counted on both human
+        surfaces for the same reason: a deferral is visible or it is a deletion.
+        """
+        return sum(1 for r in self.results if r.is_deferred and not r.is_superseded)
 
     @property
     def superseded_count(self) -> int:
@@ -597,7 +643,7 @@ class VerifyReport:
         — which is the honest bound, and strictly better than the invisible
         truncation it replaces.
         """
-        return len(self.results) - len(self.live_results)
+        return sum(1 for r in self.results if r.is_superseded)
 
     @property
     def worst_status(self) -> str:
@@ -779,6 +825,12 @@ def verify(
         # claim retired this one is a fact about the seal window, not something
         # the evidence earns.
         result.superseded_by = _superseded_by(stored, position, manifest.claims)
+        # Around the ladder for the same reason, and validated the same way: the
+        # mark subtracts from the verdict, so it is dropped (and the claim
+        # counts) when malformed, when the claim was retired anyway, and when
+        # the claim grades failed — which a deferral never sets aside.
+        if not result.is_superseded and result.grade != GRADE_FAILED:
+            result.deferred = _deferral_mark(stored)
         # Assigned around the ladder, like witness-unavailable: the environment
         # comparison is a fact about this run, not a grade the evidence earns.
         # It is set on EVERY path, including witness-unavailable — the sealed
@@ -1066,13 +1118,28 @@ def _claim_key(entry) -> Optional[tuple]:
 
 
 def live_claims(claims: list) -> list:
-    """A manifest's claim entries that no later claim in the window retired.
+    """A manifest's claim entries that no later claim in the window retired and
+    that the operator did not defer.
 
     The one definition of "live", shared by the verdict (``verify``) and by the
     seal's own summary line, so the two cannot report different denominators for
     the same note.
     """
-    return [c for i, c in enumerate(claims) if _superseded_by(c, i, claims) is None]
+    return [
+        c
+        for i, c in enumerate(claims)
+        if _superseded_by(c, i, claims) is None and _deferral_mark(c) is None
+    ]
+
+
+def deferred_claims(claims: list) -> list:
+    """A manifest's claim entries set aside by a valid deferral mark (and not
+    retired, which would make the mark moot). Read by the same rule as verify."""
+    return [
+        c
+        for i, c in enumerate(claims)
+        if _superseded_by(c, i, claims) is None and _deferral_mark(c) is not None
+    ]
 
 
 def _superseded_by(stored: dict, position: int, claims: list) -> Optional[int]:
@@ -1228,6 +1295,160 @@ def _load_claims(session: Session) -> list[Claim]:
         if line:
             claims.append(Claim.from_dict(json.loads(line)))
     return claims
+
+
+# --- deferral: setting one unsealed claim aside from the next verdict ---------
+#
+# A seal window is every claim since the last seal, so a claim declared over
+# work that never reached this commit — an interrupted unit's draft — rides into
+# an unrelated unit's seal and grades stale there. The grade is right and the
+# window is wrong for that one claim. A deferral is the operator saying so, with
+# a reason, in an append-only record:
+#
+# - it subtracts from the VERDICT, never from the RECORD: the claim is graded and
+#   published as usual and marked `deferred` with the reason (`_redact_result`);
+# - it binds one claim INSTANCE by its index in claims.jsonl, never a label going
+#   forward, so re-declaring the gate makes a claim that votes;
+# - it is never honoured for a WITNESSED FAILURE. A command that exited nonzero
+#   is evidence against the claim, and setting it aside would be the cheapest
+#   path to green there is. Refused at declaration, and re-checked at seal and
+#   at verify against the grade, because a record file and a note can both be
+#   edited by hand.
+#
+# Kept in its own file rather than in claims.jsonl: an older binary loads every
+# line of claims.jsonl as a Claim and would raise on a deferral record, while it
+# ignores a file it does not know — and then counts the claim, which is the
+# fail-closed direction.
+
+def _deferrals_path(session: Session) -> Path:
+    return session.root / "deferrals.jsonl"
+
+
+def _load_deferrals(session: Session) -> list:
+    """The deferral records, as written. A line this binary cannot read is
+    skipped: a record nobody can parse defers nothing, so its claim votes."""
+    path = _deferrals_path(session)
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text(encoding="ascii").splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _valid_reason(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _window_deferrals(session: Session, all_claims: list, watermark: int) -> dict:
+    """{window position: reason} for the records that name a claim in this window.
+
+    A record names a claim by absolute index AND by the (ctype, label) it had
+    when deferred; a record whose index is outside the window, or whose claim
+    no longer carries that identity, defers nothing.
+    """
+    out: dict = {}
+    for record in _load_deferrals(session):
+        idx = record.get("claim_index")
+        if not _is_index(idx) or not (watermark <= idx < len(all_claims)):
+            continue
+        claim = all_claims[idx]
+        if (record.get("ctype"), record.get("label")) != (claim.ctype, claim.label):
+            continue
+        if not _valid_reason(record.get("reason")):
+            continue
+        out.setdefault(idx - watermark, record["reason"])
+    return out
+
+
+def declare_deferral(
+    session: Session, label: str, reason: str, ctype: Optional[str] = None
+) -> dict:
+    """Set the live, unsealed claim labelled ``label`` aside from the next verdict.
+
+    Returns the record written, with ``position`` (the claim's index in the
+    next seal's window, which is the `claim #N` every surface prints) added.
+    Raises ``ManifestError``, writing nothing, when the deferral cannot be
+    honoured — see the section comment above for why each refusal exists.
+    """
+    if not _valid_reason(reason):
+        raise ManifestError("--defer needs --reason: a deferral with no reason is a silent drop")
+    all_claims = _load_claims(session)
+    watermark = _last_seal_watermark(session)
+    window = all_claims[watermark:]
+    latest: dict = {}
+    for pos, claim in enumerate(window):
+        latest[(claim.ctype, claim.label)] = pos
+    candidates = sorted(
+        pos for (t, lbl), pos in latest.items()
+        if lbl == label and (ctype is None or t == ctype)
+    )
+    named = f"{ctype} {label!r}" if ctype else repr(label)
+    if not candidates:
+        if any(
+            c.label == label and (ctype is None or c.ctype == ctype)
+            for c in all_claims[:watermark]
+        ):
+            raise ManifestError(
+                f"claim {named} was already sealed into an earlier note, which is "
+                f"published; only an unsealed claim can be deferred"
+            )
+        raise ManifestError(
+            f"no unsealed claim {named} in the current seal window "
+            f"(claims [{watermark},{len(all_claims)}))"
+        )
+    if len(candidates) > 1:
+        types = ", ".join(window[pos].ctype for pos in candidates)
+        raise ManifestError(
+            f"{named} names {len(candidates)} live claims ({types}); pass the "
+            f"claim type to choose one"
+        )
+    pos = candidates[0]
+    claim = window[pos]
+    absolute = watermark + pos
+    if any(r.get("claim_index") == absolute for r in _load_deferrals(session)):
+        raise ManifestError(f"claim #{pos} {claim.ctype} {claim.label!r} is already deferred")
+    events = session.events()
+    for idx in claim.event_indices:
+        if 0 <= idx < len(events) and events[idx].exit_code not in (None, 0):
+            raise ManifestError(
+                f"claim #{pos} {claim.ctype} {claim.label!r} is bound to event "
+                f"{idx}, which exited {events[idx].exit_code}: a witnessed failure "
+                f"is evidence against the claim, and deferral never takes one out "
+                f"of a verdict. Fix it, re-run, and re-claim to supersede it"
+            )
+    record = {
+        "claim_index": absolute,
+        "ctype": claim.ctype,
+        "label": claim.label,
+        "reason": reason,
+        "declared_at_event": len(events) - 1,
+    }
+    with _append_lock(session.root):
+        with _open_private_append(_deferrals_path(session)) as fh:
+            fh.write(canonical_json(record) + b"\n")
+    return dict(record, position=pos)
+
+
+def _deferral_mark(stored: dict) -> Optional[str]:
+    """The reason a note entry's ``deferred`` mark carries, validated, or None.
+
+    Read the way ``superseded_by`` is read: a mark subtracts a claim from the
+    verdict, so a malformed one is dropped and the claim counts. A mark on an
+    entry whose sealed grade is ``failed`` is dropped for the same reason the
+    seal never writes one there.
+    """
+    mark = stored.get("deferred")
+    if not isinstance(mark, dict) or not _valid_reason(mark.get("reason")):
+        return None
+    if stored.get("grade") == GRADE_FAILED:
+        return None
+    return mark["reason"]
 
 
 # --- operator authority ------------------------------------------------------
@@ -2012,6 +2233,7 @@ def _redact_result(
     entries: list,
     claim_index: int = 0,
     superseded_by: Optional[int] = None,
+    deferred: Optional[str] = None,
 ) -> RedactedClaim:
     d = r.to_dict()
     # Redact argv in the exported claim view, and DECLARE the projection that
@@ -2076,6 +2298,10 @@ def _redact_result(
         }
         for i, change in enumerate(d["delta"])
     ]
+    # The operator's reason for setting this claim aside: their text, published,
+    # so redacted and reported by the same pass as every other such field.
+    if deferred is not None:
+        d["deferred"] = {"reason": _field("deferred.reason", "reason", deferred)}
 
     d["redaction"] = {
         "projection_version": redact.PROJECTION_VERSION,

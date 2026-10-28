@@ -238,6 +238,11 @@ class GradeResult:
     grade, and giving it one would be the invented fact this whole type exists
     not to produce. Serialized only when non-empty, on ``superseded_by``'s
     precedent — every other claim would otherwise carry an empty list forever.
+
+    ``deferred`` is the reason an operator gave for setting this claim aside
+    (``didrun claim --defer``). Verify-side for ``superseded_by``'s reason: the
+    seal writes the mark onto the exported entry and verify reads it back,
+    validated, so it is not in ``to_dict``.
     """
 
     claim: Claim
@@ -252,6 +257,7 @@ class GradeResult:
     env_reason: str = ""
     superseded_by: Optional[int] = None
     conjunct_grades: tuple = ()
+    deferred: Optional[str] = None
 
     @property
     def is_superseded(self) -> bool:
@@ -262,6 +268,16 @@ class GradeResult:
         never relabelled, re-graded or dropped.
         """
         return self.superseded_by is not None
+
+    @property
+    def is_deferred(self) -> bool:
+        """Whether the operator set this claim aside from the commit's verdict.
+
+        Record, not verdict, exactly like supersession, with the operator's
+        reason in ``deferred``. Never true of a ``failed`` result: the seal and
+        verify both refuse to honour a deferral that reaches one.
+        """
+        return self.deferred is not None
 
     def to_dict(self) -> dict:
         d = {
@@ -339,7 +355,7 @@ def grade_conjunction(
 ) -> GradeResult:
     """Grade a conjunction as the WORST of the claims it names. Never better.
 
-    ``siblings`` are the other graded results of the same seal window. Two kinds
+    ``siblings`` are the other graded results of the same seal window. Three kinds
     are filtered out here rather than at the call site, so both callers (seal and
     verify) get the same resolution from the same rule:
 
@@ -347,6 +363,8 @@ def grade_conjunction(
       attempt shares its label with the claim that stands in its place. Skipping
       it is what lets a conjunction name a gate that failed and was fixed inside
       the window; counting it would make every such name ambiguous.
+    - **deferred entries.** A claim the operator set aside is not part of this
+      commit, so a name that resolves only to one resolves to nothing here.
     - **other conjunctions.** A conjunction naming a conjunction resolves to no
       match and grades ``unknown``. That is deliberate: it keeps resolution one
       level deep, so there is no recursion to bound and no cycle to detect, and
@@ -370,7 +388,8 @@ def grade_conjunction(
     pool = [
         s
         for s in (siblings or ())
-        if (as_of is not None or not s.is_superseded) and s.claim.ctype != CONJUNCTION
+        if (as_of is not None or not (s.is_superseded or s.is_deferred))
+        and s.claim.ctype != CONJUNCTION
     ]
     where = (
         "in this seal window"

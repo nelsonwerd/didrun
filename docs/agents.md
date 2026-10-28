@@ -81,9 +81,9 @@ it exits 0. Never present un-wrapped commands as verified.
 
 ---
 
-## Two v0.2 behaviours the loop depends on
+## Behaviours the loop depends on
 
-Both are what make "fix, re-claim, re-seal, re-verify until it exits 0" actually
+The first two are what make "fix, re-claim, re-seal, re-verify until it exits 0" actually
 converge, and an agent that doesn't know about them will read the first as a bug.
 
 - **`claim` refuses to bind past a failure.** With no `--event`, a claim binds the
@@ -96,6 +96,15 @@ converge, and an agent that doesn't know about them will read the first as a bug
   surfaces. This is why a fix-verify loop converges instead of accumulating red rows —
   but it is keyed on `(type, label)`, so an agent that varies the label each pass gets
   a growing pile of stale claims rather than one that supersedes.
+
+- **A claim that is not this unit's can be set aside, visibly.** A seal covers every
+  claim since the last seal, so an interrupted unit's claim over draft work rides into
+  the next, unrelated seal and grades `stale` there. `didrun claim --defer "<label>"
+  --reason "<why>"` sets that one claim aside from the next verdict: it stays in the
+  note, graded, with the reason, and is counted on every surface. It binds that claim,
+  not the label, so re-declaring the gate later makes a claim that votes; and it refuses
+  a claim bound to a command that exited nonzero. Use it for work that genuinely is not
+  in the commit — never to make a claim about *this* commit stop counting.
 
 Note the shape of what this buys: repeatedly claiming a gate until one attempt goes
 green is not *prevented*. Every attempt stays in the note and the retired count is
