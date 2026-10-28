@@ -43,6 +43,17 @@ The first five are the ladder, evaluated worst-first — `failed`, `unknown`, `s
 than the weakest fact about it. The last two are not rungs: one replaces a grade when
 the evidence behind it cannot be produced, the other overrides the whole report.
 
+**A command that changes the tree while it runs is never `tree-exact`.** A run that
+writes a lock file, updates a snapshot or reformats a file ran against the tree it
+started from, not the one it left, so "ran against exactly the sealed tree" is false of
+it even when the unit commits exactly what it wrote. For such a command, "since the
+evidence" means since the tree it *started* from: the files the run itself wrote are
+changes like any other, named in the reason (`the run itself changed 1 path(s):
+ant.lock`) and shown in the delta. Declaring them with `--path` makes the claim
+`scope-exact`. didrun never declares them on the claimant's behalf: a command that
+rewrites what it checks is exactly what a reviewer must see, and a scope the tool chose
+would attest nothing. A run whose starting tree was not recorded grades `unknown`.
+
 ## What it protects against, by actor
 
 | Actor | didrun detects / prevents | didrun does NOT stop |

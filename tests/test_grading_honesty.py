@@ -112,7 +112,15 @@ def test_empty_delta_still_means_the_trees_are_equal(repo: Path):
                   pathspecs=("src",), declared_at_index=0)
     r = grade(claim, sealed_tree, s.events(), repo, s.blobs.root)
     assert r.grade == "stale"
-    assert r.reason == "evidence tree equals sealed tree but command was not self-stable"
+    # The old sentence survives as the prefix; since the self-stability fix
+    # (tests/test_self_stability_delta.py) it also names what the run changed,
+    # and the STALE row carries that change as its delta instead of nothing.
+    assert r.reason == (
+        "evidence tree equals sealed tree but command was not self-stable — the "
+        "run itself changed 1 path(s): made.py; add --path made.py to make this "
+        "scope-exact"
+    )
+    assert [c.path for c in r.delta] == ["made.py"]
 
 
 def test_witnessed_failure_dominates_a_witnessed_success(repo: Path):

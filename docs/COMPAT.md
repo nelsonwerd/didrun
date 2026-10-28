@@ -415,6 +415,35 @@ proof about all repositories. Both configurations are pinned by tests.
 
 `.didrun/` itself remains excluded unconditionally, regardless of gitignore state.
 
+## A command that is not self-stable is graded from where it started (behaviour, not format)
+
+After v0.2.0, a claim whose backing command changed the tree while it ran is graded
+against every tree that command saw — the one it started from and the one it left —
+rather than only the one it left. No note field changes; grades and reason strings do,
+and `verify` regrades with the binary that runs it, so this reaches notes already sealed.
+
+- **Reason strings.** The self-contradictory `tree moved since evidence: 0 path(s) differ`
+  (a STALE carrying no delta, for a unit that committed exactly what its run wrote) is
+  gone. It reads `command was not self-stable: the run itself changed N path(s): <paths>,
+  and the sealed tree is the tree it left — add --path … to make this scope-exact`. The
+  pathspec form keeps its old sentence as a prefix — `evidence tree equals sealed tree
+  but command was not self-stable — the run itself changed …` — and the out-of-scope and
+  `tree moved since evidence: N path(s) differ` forms keep theirs and append `; not
+  self-stable: the run itself changed …`. Reasons for a self-stable command are
+  byte-identical to before.
+- **The delta.** For a command that is not self-stable it now includes the files the run
+  itself wrote, so a STALE row always carries one.
+- **One grade can rise.** A unit that committed exactly what its run wrote, with those
+  paths declared by `--path`, now grades `scope-exact` where it graded `stale`. The scope
+  is still the claimant's; didrun never scopes a claim to its run's outputs by itself.
+- **One grade can fall, and that is the point.** A run that rewrote an *undeclared* path,
+  followed by an edit inside the declared scope, used to grade `scope-exact`: scope was
+  judged only from the tree the run left, so the rewrite was never in it. That claim now
+  grades `stale` and names the rewrite.
+- **No starting digest is `unknown`.** A command whose tree before the run was not
+  recorded used to be graded on the tree it left alone; what it ran against is unknown,
+  so the claim now says exactly that.
+
 ## Ledger permissions (v0.2) and where the guarantee stops
 
 v0.2 forces the ledger ROOT to `0700` on every writable open — creation and re-open

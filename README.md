@@ -165,6 +165,13 @@ when the evidence behind it cannot be produced, the other overrides the whole re
 means the evidence tree equals the sealed tree — it does **not** claim the code is
 correct or that the command meaningfully tested anything.
 
+A command that writes into the tree while it runs (a lock file, a snapshot, a
+formatter) is never `tree-exact`, even when you commit exactly what it wrote: it ran
+against the tree it started from. Its row names what the run itself changed —
+`the run itself changed 1 path(s): ant.lock … add --path ant.lock to make this
+scope-exact` — and declaring those paths with `--path` is how it earns `scope-exact`.
+didrun never declares them for you.
+
 ## The six commands
 
 - `didrun run [--tee] [--heartbeat SECONDS] -- <cmd>` — record a wrapped execution (complete capture). `--tee` mirrors the child's raw output to your terminal as it arrives (local only, never redacted); `--heartbeat` prints a content-free progress line to stderr. Both default **off**, so anything parsing didrun's stdout sees what it saw before.

@@ -477,6 +477,15 @@ def grade(
             exit_code=ev.exit_code,
         )
 
+    if not ev.self_stable():
+        return _grade_not_self_stable(
+            claim, idx, ev, sealed_tree, delta, repo, ledger_objects
+        )
+
+    # From here the command is self-stable and its tree is not the sealed one,
+    # so `delta` is non-empty: the empty-delta sentences live in
+    # _grade_not_self_stable, the only place that can reach them.
+    #
     # scope-exact: every change is within the claimant-declared pathspecs.
     if claim.pathspecs:
         out_of_scope = [c for c in delta if not _within(c.path, claim.pathspecs)]
@@ -486,16 +495,6 @@ def grade(
                 GRADE_SCOPE_EXACT,
                 reason=f"all {len(delta)} change(s) within declared pathspecs",
                 delta=delta,
-                supporting_event_index=idx,
-                exit_code=ev.exit_code,
-            )
-        if not delta:
-            # No delta at all but not self-stable → the evidence tree equals the
-            # sealed tree yet the command wasn't self-stable; that's stale-clean.
-            return GradeResult(
-                claim,
-                GRADE_STALE,
-                reason="evidence tree equals sealed tree but command was not self-stable",
                 supporting_event_index=idx,
                 exit_code=ev.exit_code,
             )
@@ -529,10 +528,117 @@ def grade(
     )
 
 
+def _grade_not_self_stable(
+    claim: Claim,
+    idx: int,
+    ev: Event,
+    sealed_tree: str,
+    since: list,
+    repo: Path,
+    ledger_objects: Optional[Path],
+) -> GradeResult:
+    """Grade a command that changed the tree while it ran. Never tree-exact.
+
+    Such a command ran against no single tree: it started from ``tree_before``
+    and left ``tree_after``. So the delta is every path at which EITHER of those
+    differs from the sealed tree, and a file the run itself wrote counts as a
+    change like any other. Judging only from the tree it left (the old rule)
+    had two faces: when the unit committed exactly what the run wrote, it
+    printed "tree moved since evidence: 0 path(s) differ" — a STALE with no
+    delta, contradicting itself — and when an in-scope edit followed an
+    undeclared rewrite, it graded scope-exact without the rewrite ever being in
+    scope.
+
+    The run's own changes are named in the reason, because they are the cause a
+    reader needs and the event already measured them. Scope still comes ONLY
+    from the claimant: declaring the run's outputs makes this scope-exact, and
+    didrun never declares them on anyone's behalf (module docstring: relevance
+    is never inferred). A command that rewrites what it checks — a snapshot
+    update, a formatter, a lockfile — is exactly what a reviewer must see.
+    """
+
+    def _unknown(reason: str) -> GradeResult:
+        return GradeResult(
+            claim,
+            GRADE_UNKNOWN,
+            reason=reason,
+            supporting_event_index=idx,
+            exit_code=ev.exit_code,
+        )
+
+    if ev.tree_before is None:
+        return _unknown(
+            "backing event has no tree digest from before it ran, so what the "
+            "command ran against is unknown"
+        )
+    made = gitplumbing.tree_delta(repo, ev.tree_before, ev.tree_after, ledger_objects)
+    full = gitplumbing.tree_delta(repo, ev.tree_before, sealed_tree, ledger_objects)
+    if made is None or full is None:
+        return _unknown("delta not computable: evidence tree objects unavailable")
+
+    seen = {c.path for c in full}
+    delta = list(full) + [c for c in since if c.path not in seen]
+    made_note = f"the run itself changed {len(made)} path(s): " + _name_paths(
+        c.path for c in made
+    )
+
+    def _result(grade_: str, reason: str) -> GradeResult:
+        return GradeResult(
+            claim,
+            grade_,
+            reason=reason,
+            delta=delta,
+            supporting_event_index=idx,
+            exit_code=ev.exit_code,
+        )
+
+    out_of_scope = [c for c in delta if not _within(c.path, claim.pathspecs)]
+    if claim.pathspecs and not out_of_scope:
+        return _result(
+            GRADE_SCOPE_EXACT,
+            f"all {len(delta)} change(s) within declared pathspecs, "
+            f"{len(made)} of them made by the run itself",
+        )
+    hint = _widening_hint(c.path for c in out_of_scope)
+    if claim.pathspecs and not since:
+        # The pre-fix sentence is kept as the prefix: a consumer matching it
+        # still matches, and what it never said is appended after the dash.
+        return _result(
+            GRADE_STALE,
+            "evidence tree equals sealed tree but command was not self-stable "
+            f"— {made_note}; {hint}",
+        )
+    if claim.pathspecs:
+        return _result(
+            GRADE_STALE,
+            f"{len(out_of_scope)} change(s) outside declared pathspecs — {hint}; "
+            f"not self-stable: {made_note}",
+        )
+    if not since:
+        return _result(
+            GRADE_STALE,
+            f"command was not self-stable: {made_note}, and the sealed tree is "
+            f"the tree it left — {hint}",
+        )
+    return _result(
+        GRADE_STALE,
+        f"tree moved since evidence: {len(since)} path(s) differ; "
+        f"not self-stable: {made_note}",
+    )
+
+
 # How many prefixes the widening hint names before it summarises the rest. A
 # hint longer than this stops being readable and starts being the delta again,
 # which the caller already has.
 WIDENING_HINT_CAP = 5
+
+
+def _name_paths(paths) -> str:
+    """Paths in words, sorted and capped like the widening hint."""
+    ordered = sorted(set(paths))
+    shown = ", ".join(ordered[:WIDENING_HINT_CAP])
+    elided = len(ordered) - WIDENING_HINT_CAP
+    return f"{shown} (+{elided} more)" if elided > 0 else shown
 
 
 def _widening_hint(paths) -> str:
