@@ -47,6 +47,7 @@ from .claims import (
     ClaimError,
     GradeResult,
     grade,
+    pool_as_declared,
 )
 from . import capture, gitplumbing, redact
 
@@ -419,6 +420,15 @@ def seal(
     # holds the authoritative mapping already.
     siblings = [r for i, r in enumerate(results) if r is not None and i not in superseded]
     for i in conjunctions:
+        # A retired conjunction is graded as the record of its own declaration,
+        # against the claims standing THEN; the live one against the window as
+        # sealed. `verify` makes the same split, so the two agree.
+        if i in superseded:
+            results[i] = grade(
+                new_claims[i], tree, events, repo, ledger_objects,
+                siblings=pool_as_declared(results, i), as_of=i,
+            )
+            continue
         results[i] = grade(
             new_claims[i], tree, events, repo, ledger_objects, siblings=siblings
         )
@@ -758,9 +768,12 @@ def verify(
     # reading the umask inside it is a read-modify-write (capture.process_umask).
     current_fingerprint = capture.env_fingerprint()
 
-    def _graded(position: int, stored: dict, claim: Claim, siblings=None) -> GradeResult:
+    def _graded(
+        position: int, stored: dict, claim: Claim, siblings=None, as_of=None
+    ) -> GradeResult:
         result = _verify_claim(
-            stored, claim, manifest, entries, events, repo, ledger_objects, siblings
+            stored, claim, manifest, entries, events, repo, ledger_objects,
+            siblings, as_of,
         )
         # Assigned around the ladder for the same reason as the two below: which
         # claim retired this one is a fact about the seal window, not something
@@ -798,6 +811,13 @@ def verify(
     # replaced it, so counting it would make that name ambiguous.
     siblings = [r for r in results if r is not None]
     for position, c, claim in deferred:
+        # The seal's split, read off the note: a retired conjunction regrades
+        # as the record of its own declaration (claims.pool_as_declared).
+        if _superseded_by(c, position, manifest.claims) is not None:
+            results[position] = _graded(
+                position, c, claim, pool_as_declared(results, position), position
+            )
+            continue
         results[position] = _graded(position, c, claim, siblings)
     return VerifyReport(
         commit=manifest.commit,
@@ -948,6 +968,7 @@ def _verify_claim(
     repo: Path,
     ledger_objects: Optional[Path],
     siblings: Optional[list] = None,
+    as_of: Optional[int] = None,
 ) -> GradeResult:
     """Grade one sealed claim, checking the note's binding to its evidence first.
 
@@ -965,11 +986,12 @@ def _verify_claim(
 
     A conjunction takes the first path: it binds no event, so the seal wrote it
     no evidence block and there is no binding to check. ``siblings`` is what it
-    is graded against, and it is forwarded unread on every other path.
+    is graded against, and it is forwarded unread on every other path, as is
+    ``as_of`` (a retired conjunction's own declaration point).
     """
     evidence = stored.get("evidence")
     if not isinstance(evidence, dict):
-        return _regrade(claim, manifest, events, repo, ledger_objects, siblings)
+        return _regrade(claim, manifest, events, repo, ledger_objects, siblings, as_of)
 
     sealed_grade = stored.get("grade")
     idx = evidence.get("event_index")
@@ -986,7 +1008,7 @@ def _verify_claim(
             sealed_grade=sealed_grade,
         )
 
-    result = _regrade(claim, manifest, events, repo, ledger_objects, siblings)
+    result = _regrade(claim, manifest, events, repo, ledger_objects, siblings, as_of)
     result.evidence_bound = True
     result.sealed_grade = sealed_grade
     return result
@@ -1116,9 +1138,12 @@ def _regrade(
     repo: Path,
     ledger_objects: Optional[Path],
     siblings: Optional[list] = None,
+    as_of: Optional[int] = None,
 ) -> GradeResult:
     try:
-        return grade(claim, manifest.tree, events, repo, ledger_objects, siblings)
+        return grade(
+            claim, manifest.tree, events, repo, ledger_objects, siblings, as_of=as_of
+        )
     except Exception as exc:  # object gc'd or unreadable → unknown, not crash
         return GradeResult(claim, "unknown", reason=f"regrade failed: {exc}")
 

@@ -311,7 +311,32 @@ def _witnessed_failure(claim: Claim, events: list[Event]) -> Optional[tuple[int,
     return None
 
 
-def grade_conjunction(claim: Claim, siblings: Optional[list] = None) -> GradeResult:
+def pool_as_declared(window: list, position: int) -> list:
+    """The ordinary claims that were live when window claim ``position`` was declared.
+
+    ``window`` is a seal window's graded results by position (``None`` for a
+    slot not graded yet). Only the prefix before ``position`` is read, and in
+    it only the LATEST claim for each ``(ctype, label)`` — the one standing at
+    that point. A claim a later declaration retires is still in this pool if
+    the retirement came after ``position``, because when the conjunction was
+    declared it was the claim standing.
+
+    This is how a SUPERSEDED conjunction is graded: its record must describe
+    the attempt it was, not the window as sealed. A live conjunction resolves
+    against the sealed window instead (``grade_conjunction``'s own pool), which
+    is what keeps every published verdict unchanged.
+    """
+    latest: dict = {}
+    for i, r in enumerate(window[:position]):
+        if r is None or r.claim.ctype == CONJUNCTION:
+            continue
+        latest[(r.claim.ctype, r.claim.label)] = i
+    return [window[i] for i in sorted(latest.values())]
+
+
+def grade_conjunction(
+    claim: Claim, siblings: Optional[list] = None, as_of: Optional[int] = None
+) -> GradeResult:
     """Grade a conjunction as the WORST of the claims it names. Never better.
 
     ``siblings`` are the other graded results of the same seal window. Two kinds
@@ -332,12 +357,27 @@ def grade_conjunction(claim: Claim, siblings: Optional[list] = None) -> GradeRes
     ``unknown`` and the reason names it: a member it cannot identify is a member
     it cannot vouch for, and grading around the gap is how a conjunction would
     come out better than its parts.
+
+    ``as_of`` grades a SUPERSEDED conjunction as the record of the attempt it
+    was: ``siblings`` is then ``pool_as_declared(window, as_of)``, already the
+    claims standing at its declaration, and is not filtered for supersession a
+    second time — a member retired AFTER this conjunction was declared is the
+    member it conjoined. The reason says which window position it describes.
+    Without this, a conjunction declared while a gate was red and re-declared
+    after the fix left a retired row reading TREE-EXACT, resolved against a
+    gate it never named.
     """
     pool = [
         s
         for s in (siblings or ())
-        if not s.is_superseded and s.claim.ctype != CONJUNCTION
+        if (as_of is not None or not s.is_superseded) and s.claim.ctype != CONJUNCTION
     ]
+    where = (
+        "in this seal window"
+        if as_of is None
+        else "declared before it in this seal window"
+    )
+    prefix = "" if as_of is None else f"as declared at claim #{as_of}: "
     pairs: list = []
     unresolved: list[str] = []
     for name in claim.conjuncts:
@@ -347,15 +387,15 @@ def grade_conjunction(claim: Claim, siblings: Optional[list] = None) -> GradeRes
             continue
         pairs.append((name, None))
         unresolved.append(
-            f"{name!r} names no claim in this seal window"
+            f"{name!r} names no claim {where}"
             if not matches
-            else f"{name!r} names {len(matches)} claims in this seal window"
+            else f"{name!r} names {len(matches)} claims {where}"
         )
     if unresolved:
         return GradeResult(
             claim,
             GRADE_UNKNOWN,
-            reason="unresolved conjunct: " + "; ".join(unresolved),
+            reason=prefix + "unresolved conjunct: " + "; ".join(unresolved),
             conjunct_grades=tuple(pairs),
         )
     worst = worst_grade(g for _name, g in pairs)
@@ -365,7 +405,7 @@ def grade_conjunction(claim: Claim, siblings: Optional[list] = None) -> GradeRes
     return GradeResult(
         claim,
         worst,
-        reason=f"worst of {len(pairs)} conjunct(s): {named!r} graded {worst}",
+        reason=f"{prefix}worst of {len(pairs)} conjunct(s): {named!r} graded {worst}",
         conjunct_grades=tuple(pairs),
     )
 
@@ -377,6 +417,7 @@ def grade(
     repo: Path,
     ledger_objects: Optional[Path] = None,
     siblings: Optional[list] = None,
+    as_of: Optional[int] = None,
 ) -> GradeResult:
     """Grade one claim against ``sealed_tree``. First match wins.
 
@@ -387,10 +428,11 @@ def grade(
     grades no evidence of its own, so it is dispatched BEFORE the ladder rather
     than added as a rung. Every rung below is untouched, and a caller that
     forgets ``siblings`` gets a conjunction graded ``unknown`` — the fail-closed
-    direction, never a green one.
+    direction, never a green one. ``as_of`` is forwarded to it, for a superseded
+    conjunction graded as the record of its own declaration.
     """
     if claim.ctype == CONJUNCTION:
-        return grade_conjunction(claim, siblings)
+        return grade_conjunction(claim, siblings, as_of=as_of)
 
     # A witnessed failure among the bound events DOMINATES a witnessed success.
     # Consulting _supporting_event first graded a claim bound to

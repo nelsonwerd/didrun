@@ -109,6 +109,17 @@ against the results of the other claims **in that same note** — never against 
 verdict. A conjunct label that names no live claim in the window, or more than one, grades
 the conjunction `unknown` and the reason names it.
 
+**A superseded conjunction is graded as the attempt it was (after v0.2.0).** The live
+conjunction — the one that votes — resolves its names against the window as sealed, as
+above, unchanged. A conjunction a later re-declaration *retired* is record, not verdict,
+and its record now describes its own declaration: its names resolve against the ordinary
+claims standing at the point it was declared (each label at its latest declaration
+before it), and its reason begins `as declared at claim #N:`. Before this, a conjunction
+declared while a gate was red and re-declared after the fix left a retired row reading
+`TREE-EXACT`, resolved against a fix it never named. No verdict moves; a retired row in a
+note sealed by v0.2.0 regrades under this rule when a later binary verifies it, so its
+displayed grade and reason may differ from the sealed ones — which is the correction.
+
 Two additive keys carry it, both read with `.get()`:
 
 ```json
