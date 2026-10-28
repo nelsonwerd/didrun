@@ -477,11 +477,15 @@ def test_a_note_without_a_secrets_block_reads_back_additively():
 
 # --- change 4b: the detector-set version is declared, not inferred -----------
 
-def test_detector_set_version_is_two_and_the_projection_version_is_not(repo: Path):
+def test_detector_set_version_is_declared_and_the_projection_version_is_not(repo: Path):
     """Re-tiering every detector and changing what the entropy sweep matches IS
     a detector-set change. The span-partition algorithm is untouched.
+
+    The set is at 3 since the assignment detector learned to read a shell
+    expansion (tests/test_shell_expansion_secrets.py); the note carries the
+    module constant, whatever it is, and the projection version stays 1.
     """
-    assert redact.DETECTOR_SET_VERSION == 2
+    assert redact.DETECTOR_SET_VERSION == 3
     assert redact.PROJECTION_VERSION == 1
     s = _session(repo)
     _one_event(s, repo, "print('ok')")
@@ -490,9 +494,9 @@ def test_detector_set_version_is_two_and_the_projection_version_is_not(repo: Pat
         Claim(ctype="tests-pass", label="ok", event_indices=(0,), declared_at_index=0),
     )
     m = M.seal(s, repo)
-    assert m.claims[0]["redaction"]["detector_set_version"] == 2
+    assert m.claims[0]["redaction"]["detector_set_version"] == 3
     assert m.claims[0]["redaction"]["projection_version"] == 1
-    assert m.secrets["detector_set_version"] == 2
+    assert m.secrets["detector_set_version"] == 3
 
 
 def test_a_v1_projection_is_distinguishable_from_a_v2_one(repo: Path):

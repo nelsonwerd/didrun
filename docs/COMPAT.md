@@ -190,6 +190,39 @@ the number is for — a consumer comparing a `1` projection with a `2` one is to
 detectors differ instead of having to infer it. `projection_version` stays 1: the
 span-partition algorithm did not change.
 
+**`detector_set_version` is 3 after v0.2.0.** Two changes to what one detector matches,
+both found dogfooding didrun on a real build:
+
+- **A shell expansion is not a secret.** `env-secret-assignment` used to fire on any
+  `NAME=value` whose name looked secret, so a recorded `bash -c` script reading a key out
+  of a gitignored env file — `export API_KEY="$(grep '^API_KEY=' .env | cut -d= -f2-)"` —
+  refused its seal at `block`, although the argv holds the recipe for reading the secret
+  and never the secret. The value is now parsed as the shell word it is: one that is
+  purely expansion (`$(…)`, backticks, `${NAME}`, `$NAME`, alone or concatenated, bare or
+  double-quoted) is not a finding, and anything literal still is — a literal secret
+  beside an expansion, a literal tail glued to one, a single-quoted `'$(…)'` (the shell
+  does not expand it), `${X:-default}` (the default is literal), and an unterminated
+  substitution. The manifest backstop decodes the JSON string it is reading first, so the
+  note's `\"`-escaped copy of a script is judged the same way as the argv it came from.
+  **The cost, stated:** a literal secret written *inside* a substitution
+  (`TOKEN="$(echo s3cr3tvalue)"`) is no longer caught by this detector; the structured
+  token detectors and the entropy sweep still scan the substitution's body.
+- **A published test value notices instead of blocking.** A value that is *exactly* one
+  of a closed list of vendor-published dummies is reported under its own kind,
+  `published-test-value`, at `notice`. It is demoted, never dropped: still a finding,
+  still printed on the seal's warning, still redacted out of the note (the marker reads
+  `«redacted:published-test-value»`). Today the list is Cloudflare Turnstile's three
+  documented test *secret* keys, which always pass, always fail, or report a spent token
+  and authenticate nothing anywhere. A vendor "test mode" key that authenticates to a real
+  account — Stripe's `sk_test_…` — is a credential and is not eligible. Exact match only,
+  so no real credential can be shaped to fit; widening the list is a version bump.
+
+Both narrow what blocks; neither changes the projection rule, so `projection_version`
+stays 1. One pre-existing gap is unchanged and named so nobody reads it as new: the
+assignment pattern still sees only the value up to its first whitespace, so
+`TOKEN=$(cat f)literal` — a literal tail after a substitution containing a space — was
+never matched and still is not.
+
 ### The projection covers the claim fields, not only argv
 
 A v0.2 `redaction` block carries a second, additive list beside `applied`:

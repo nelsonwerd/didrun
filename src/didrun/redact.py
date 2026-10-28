@@ -53,11 +53,30 @@ only detector that catches an unstructured credential.
 Every finding carries its own locality (``source``, ``line``, and the offset
 inside that source), because "346 likely secret(s) found" with no address is
 not something an operator can act on.
+
+The assignment detector reads the VALUE the way the shell will. A recorded
+``bash -c`` script is one argv element holding unexpanded shell text, so
+``API_KEY="$(grep … .env | cut -d= -f2-)"`` in it is the recipe for reading a
+secret, not the secret: the inner shell expands it, and the bytes that would
+leak never reach argv. A value that is PURELY expansion — ``$(…)``, backticks,
+``${NAME}``, ``$NAME``, alone or concatenated, bare or double-quoted — is not an
+assignment finding. Anything literal in it still is, and single quotes are
+literal because the shell does not expand inside them. The structured token
+detectors and the entropy sweep still scan the substitution's body: only the
+ASSIGNMENT is not attributed to it. The cost, stated: a literal secret written
+inside a substitution (``TOKEN="$(echo s3cr3tvalue)"``) is no longer caught by
+this detector, and is caught only if another detector matches its shape.
+
+A short, closed list of PUBLISHED TEST VALUES — strings a vendor documents as
+dummies that authenticate nothing — is demoted to ``notice``, never suppressed:
+still found, still reported, still redacted out of the export. Exact match only,
+so no real credential can be fitted to it. See ``_PUBLISHED_TEST_VALUES``.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -208,8 +227,13 @@ class FieldRedaction:
 # is readable directly off the note: argv spans are in `redaction.applied` and
 # field spans are in `redaction.fields`. A consumer checks for the key rather
 # than consulting a version matrix.
+#
+# 3: the assignment detector stops firing on a value that is purely a shell
+# expansion, and a published test value is reported under its own notice-tier
+# kind instead of blocking. Version 2 shipped in v0.2.0 and is in sealed notes,
+# so unlike the 1→2 step this one is a real, released boundary.
 PROJECTION_VERSION = 1
-DETECTOR_SET_VERSION = 2
+DETECTOR_SET_VERSION = 3
 
 
 # High-confidence structured patterns. These fire on shape, not entropy.
@@ -295,9 +319,208 @@ _NAME_MIN_LEN = 3
 _NAME_LETTER_FRACTION = 0.6
 _NAME_LOWERCASE_FRACTION = 0.8
 
+# Values vendors PUBLISH as test dummies, which authenticate nothing anywhere. A
+# finding whose assignment value is exactly one of these is reported under this
+# kind at `notice`: demoted, never dropped, and still redacted. It is a closed
+# list of exact strings rather than a pattern, so no real credential can be
+# shaped to fit it, and adding to it is a DETECTOR_SET_VERSION bump. Only a value
+# whose publisher states it is a non-credential belongs here — a vendor's "test
+# mode" key that authenticates to a real test account (Stripe's `sk_test_…`) is a
+# credential and does not.
+_PUBLISHED_TEST_KIND = "published-test-value"
+_PUBLISHED_TEST_VALUES = frozenset(
+    {
+        # Cloudflare Turnstile test SECRET keys: always pass, always fail, and
+        # "token already spent". https://developers.cloudflare.com/turnstile/
+        # troubleshooting/testing/
+        "1x0000000000000000000000000000000AA",
+        "2x0000000000000000000000000000000AA",
+        "3x0000000000000000000000000000000AA",
+    }
+)
+
+# Detectors that report without blocking. The entropy sweep says only "this
+# looked random"; a published test value says "this is a known non-secret".
+_NOTICE_KINDS = frozenset({_ENTROPY_KIND, _PUBLISHED_TEST_KIND})
+
 # Per-detector revisions. Distinct from DETECTOR_SET_VERSION: this says "this
 # detector's own matcher changed", the other says "the set changed".
-_DETECTOR_VERSIONS = {_ENTROPY_KIND: 2}
+_DETECTOR_VERSIONS = {_ENTROPY_KIND: 2, "env-secret-assignment": 2}
+
+# What the shell word parser below concludes about an assignment's value.
+_VALUE_EXPANSION = "expansion"  # nothing but expansions: no literal byte
+_VALUE_LITERAL = "literal"  # nothing but literal text: no expansion
+_VALUE_MIXED = "mixed"  # both, or something this parser will not vouch for
+
+_SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# `$1`, `$?`, `$$` and friends: single-character parameter expansions.
+_SHELL_SPECIAL_PARAMS = "0123456789@*#?$!-"
+# Unquoted characters that end a shell word.
+_SHELL_WORD_END = ";&|<>()"
+
+
+class _Malformed(Exception):
+    """An expansion this parser cannot close — the value is not vouched for."""
+
+
+def _skip_quoted(text: str, i: int) -> int:
+    """Index just past the quoted segment opening at ``text[i]``."""
+    quote = text[i]
+    j = i + 1
+    while j < len(text):
+        if quote == '"' and text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == quote:
+            return j + 1
+        j += 1
+    raise _Malformed
+
+
+def _expansion_end(text: str, i: int) -> Optional[int]:
+    """Index just past the expansion starting at ``text[i]`` (a `$` or a backtick).
+
+    ``None`` means the `$` starts no expansion and is a literal character.
+    ``_Malformed`` means it starts one this parser cannot close, or one that
+    carries literal text of its own (``${X:-default}``), which is never exempt.
+    """
+    n = len(text)
+    if text[i] == "`":
+        j = i + 1
+        while j < n:
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == "`":
+                return j + 1
+            j += 1
+        raise _Malformed
+    nxt = text[i + 1] if i + 1 < n else ""
+    if nxt == "(":
+        depth = 1
+        j = i + 2
+        while j < n:
+            c = text[j]
+            if c in "'\"":
+                j = _skip_quoted(text, j)
+                continue
+            if c == "\\":
+                j += 2
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        raise _Malformed
+    if nxt == "{":
+        close = text.find("}", i + 2)
+        if close < 0 or not _SHELL_NAME.fullmatch(text, i + 2, close):
+            raise _Malformed
+        return close + 1
+    if nxt and nxt in _SHELL_SPECIAL_PARAMS:
+        return i + 2
+    m = _SHELL_NAME.match(text, i + 1)
+    return m.end() if m else None
+
+
+def _json_string_tail(text: str, start: int) -> Optional[str]:
+    """The decoded rest of the JSON string literal that ``text[start]`` is in.
+
+    The `manifest` source is the serialized note, where a recorded script's
+    double quotes arrive as ``\\"``. Reading those as literal backslashes made
+    the backstop scan flag the very expansion the argv pass had exempted. The
+    tail runs to the next unescaped ``"``; ``start`` is just past an ``=``, a
+    literal character, so it can never fall inside an escape. None when the
+    tail does not decode, which the caller treats as a value it will not vouch
+    for.
+    """
+    j = start
+    while j < len(text):
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == '"':
+            break
+        j += 1
+    try:
+        return json.loads('"' + text[start:j] + '"')
+    except ValueError:
+        return None
+
+
+def _assignment_value(text: str, start: int, json_encoded: bool) -> tuple[str, str]:
+    """``_shell_value`` for an assignment value, decoding JSON first if needed."""
+    if not json_encoded:
+        return _shell_value(text, start)
+    tail = _json_string_tail(text, start)
+    if tail is None:
+        return _VALUE_MIXED, ""
+    return _shell_value(tail, 0)
+
+
+def _shell_value(text: str, start: int) -> tuple[str, str]:
+    """Classify the shell word beginning at ``text[start]``.
+
+    Returns ``(form, literal)``: whether the word is all expansion, all literal
+    (and then its literal text, quotes removed), or mixed. It follows the word
+    across whitespace inside quotes and substitutions, which is exactly what
+    the assignment regex's ``[^\\s]`` cannot do. Anything this parser does not
+    understand is MIXED, so the doubt resolves toward a finding.
+    """
+    literal: list[str] = []
+    expansions = 0
+    quoted = False
+    i = start
+    n = len(text)
+    try:
+        while i < n:
+            c = text[i]
+            if not quoted:
+                if c.isspace() or c in _SHELL_WORD_END:
+                    break
+                if c == '"':
+                    quoted = True
+                    i += 1
+                    continue
+                if c == "'":
+                    end = _skip_quoted(text, i)
+                    literal.append(text[i + 1:end - 1])
+                    i = end
+                    continue
+                if c == "\\" and i + 1 < n:
+                    literal.append(text[i + 1])
+                    i += 2
+                    continue
+            else:
+                if c == '"':
+                    quoted = False
+                    i += 1
+                    continue
+                if c == "\\" and i + 1 < n and text[i + 1] in '$`"\\':
+                    literal.append(text[i + 1])
+                    i += 2
+                    continue
+            if c in "$`":
+                end = _expansion_end(text, i)
+                if end is not None:
+                    expansions += 1
+                    i = end
+                    continue
+            literal.append(c)
+            i += 1
+    except _Malformed:
+        return _VALUE_MIXED, ""
+    if quoted:
+        return _VALUE_MIXED, ""
+    text_literal = "".join(literal)
+    if expansions and not text_literal:
+        return _VALUE_EXPANSION, ""
+    if not expansions:
+        return _VALUE_LITERAL, text_literal
+    return _VALUE_MIXED, ""
 
 
 def _shannon_bits_per_char(s: str) -> float:
@@ -319,8 +542,8 @@ def _withheld_mask(kind: str) -> str:
 
 
 def _tier(kind: str) -> str:
-    """Structured patterns block; the entropy sweep only notices."""
-    return TIER_NOTICE if kind == _ENTROPY_KIND else TIER_BLOCK
+    """Structured patterns block; the entropy sweep and known test values notice."""
+    return TIER_NOTICE if kind in _NOTICE_KINDS else TIER_BLOCK
 
 
 def _is_name(segment: str) -> bool:
@@ -450,7 +673,20 @@ def scan(data, source: Optional[FindingSource] = None) -> list[Finding]:
 
     for kind, pat in _PATTERNS:
         for m in pat.finditer(text):
-            findings.append(_make(kind, m.span()))
+            hit = kind
+            if kind == "env-secret-assignment":
+                form, literal = _assignment_value(
+                    text,
+                    m.start(2),
+                    json_encoded=source is not None and source.kind == "manifest",
+                )
+                if form == _VALUE_EXPANSION:
+                    # Not attributed and not added to matched_spans, so the
+                    # entropy sweep still scores the substitution's body.
+                    continue
+                if form == _VALUE_LITERAL and literal in _PUBLISHED_TEST_VALUES:
+                    hit = _PUBLISHED_TEST_KIND
+            findings.append(_make(hit, m.span()))
             matched_spans.append(m.span())
 
     for m in _RUNISH.finditer(text):

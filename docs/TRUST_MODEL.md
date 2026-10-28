@@ -172,6 +172,18 @@ exported bundle as **secret-bearing**:
   tree** at verify time rather than read from the note, so it is not the note's
   redacted copy — see docs/COMPAT.md.
 
+- **A `block` finding must name something that could be a secret.** The assignment
+  detector reads its value the way the shell will, so a value that is purely a shell
+  expansion (`API_KEY="$(grep … .env)"` inside a recorded `bash -c` script) is not a
+  finding: the argv holds the recipe for reading the secret, never the secret. A closed,
+  exact-match list of vendor-published dummy values (today: Cloudflare Turnstile's three
+  test secret keys) is demoted to `notice` — reported, redacted, and not blocking. That
+  is a demotion and never a suppression list: nothing found is dropped, and a value that
+  authenticates to anything, test account or not, is not eligible. The reason to allow
+  it at all is the rubber-stamp argument under operator authority, above: a gate that
+  refuses a routine command over a public constant teaches its operator to pass
+  `--allow-secrets` on reflex. docs/COMPAT.md states what this costs in recall.
+
 The scanner is a safety net tuned to bound false positives, not a guarantee. Do
 not rely on it to catch a novel secret format; keep secrets out of command output.
 How weak the entropy tier is in **both** directions is measured, not asserted —
